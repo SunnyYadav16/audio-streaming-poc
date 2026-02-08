@@ -1,0 +1,18 @@
+[project]
+name = "audio-streaming-poc"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "ctranslate2>=4.7.1",
+    "fastapi>=0.128.4",
+    "faster-whisper>=1.2.1",
+    "piper-tts>=1.4.1",
+    "sentencepiece>=0.2.1",
+    "silero-vad>=6.2.0",
+    "torch>=2.10.0",
+    "torchaudio>=2.10.0",
+    "transformers>=5.1.0",
+    "uvicorn>=0.40.0",
+    "websockets>=16.0",
+]

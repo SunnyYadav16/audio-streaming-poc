@@ -1,0 +1,67 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.eggs/
+*.egg-info/
+*.egg
+
+# Build outputs
+dist/
+build/
+*.whl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Vite
+frontend/.vite/
+frontend/node_modules/
+
+# PyTorch/ML models cache
+.cache/
+*.onnx
+*.pt
+*.pth
+
+# Recordings (audio files)
+backend/recordings/*.wav
+backend/recordings/*.webm
+
+# Temporary files
+*.tmp
+*.temp
+.temp/
+
+# Test coverage
+coverage/
+.coverage
+htmlcov/
