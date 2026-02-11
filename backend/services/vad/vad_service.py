@@ -9,7 +9,17 @@ from pathlib import Path
 
 
 class VADService:
-    """Voice Activity Detection using Silero VAD model."""
+    """
+    Voice Activity Detection service backed by the Silero VAD model.
+
+    This class wraps model loading and inference, exposing a simple
+    `process_chunk` API that takes a 16 kHz mono float32 numpy array and
+    returns both the speech probability and a boolean is_speech flag.
+
+    The service is effectively a singleton: the underlying model is loaded
+    once and reused across all sessions, but transient recurrent state should
+    be reset via `reset_states()` for each new audio stream.
+    """
     
     _instance = None
     _model = None
@@ -57,14 +67,17 @@ class VADService:
         sample_rate: int = 16000
     ) -> Tuple[float, bool]:
         """
-        Process an audio chunk and return speech probability.
-        
+        Process an audio chunk and return speech probability and decision.
+
         Args:
-            audio_chunk: Audio samples as float32 numpy array, normalized to [-1, 1]
-            sample_rate: Sample rate (8000 or 16000 Hz)
-            
+            audio_chunk: 1D float32 numpy array of audio samples normalized
+                to [-1, 1]. Can also be a torch.Tensor.
+            sample_rate: Sample rate in Hz (typically 16000).
+
         Returns:
-            Tuple of (speech_probability, is_speech)
+            (speech_probability, is_speech) where:
+                - speech_probability is a float in [0, 1]
+                - is_speech is True when probability >= 0.5
         """
         # Convert numpy to torch tensor
         if isinstance(audio_chunk, np.ndarray):
