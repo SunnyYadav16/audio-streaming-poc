@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from services.vad import get_vad_service, SpeechSegmentDetector
 from services.asr_service import get_asr_service
+from services.mt_service import get_mt_service
 
 app = FastAPI(title="Audio Streaming API")
 
@@ -263,7 +264,7 @@ sessions: dict[str, AudioSession] = {}
 
 @app.on_event("startup")
 async def startup_event():
-    """Load VAD and ASR models on startup."""
+    """Load VAD, ASR, and MT models on startup."""
     print("[API] Loading VAD model...")
     get_vad_service()
     print("[API] VAD model ready")
@@ -271,6 +272,10 @@ async def startup_event():
     print("[API] Loading ASR model (Faster-Whisper)...")
     get_asr_service()
     print("[API] ASR model ready")
+
+    print("[API] Loading MT model (NLLB-200 via CTranslate2)...")
+    get_mt_service()
+    print("[API] MT model ready")
 
 
 @app.websocket("/ws/audio")
@@ -287,10 +292,16 @@ async def audio_websocket(websocket: WebSocket):
     if lang_param not in {"en", "es", "pt"}:
         lang_param = None
 
+    # Optional target language for machine translation
+    target_lang_param = websocket.query_params.get("target_lang")
+    if target_lang_param not in {"en", "es", "pt"}:
+        target_lang_param = None
+
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     session = AudioSession(session_id, language=lang_param)
     sessions[session_id] = session
     asr_service = get_asr_service()
+    mt_service = get_mt_service() if target_lang_param else None
 
     # Track background ASR tasks so we can clean up on disconnect
     background_tasks: list[asyncio.Task] = []
@@ -316,7 +327,7 @@ async def audio_websocket(websocket: WebSocket):
         utt_id: int,
         duration: Optional[float] = None,
     ):
-        """Run Whisper in a worker thread and send the result back."""
+        """Run Whisper in a worker thread, optionally translate, and send."""
         try:
             text, used_lang = await asyncio.to_thread(
                 asr_service.transcribe, pcm, lang_param,
@@ -325,24 +336,50 @@ async def audio_websocket(websocket: WebSocket):
             if msg_type == "transcript_partial" and utt_id != utterance_id:
                 return
             if text:
+                source_lang = used_lang or lang_param or "unknown"
                 payload: dict = {
                     "type": msg_type,
                     "session_id": session_id,
                     "text": text,
-                    "language": used_lang or lang_param or "unknown",
+                    "language": source_lang,
                 }
                 if duration is not None:
                     payload["duration"] = duration
-                if msg_type == "transcript":
-                    print(
-                        f"[{session_id}] 🔇 Speech ended (duration: {duration}s) "
-                        f"lang={payload['language']} text='{text}'"
+
+                # --- Machine Translation (if target language is set) ---
+                if (
+                    mt_service is not None
+                    and target_lang_param
+                    and source_lang != target_lang_param
+                    and source_lang != "unknown"
+                ):
+                    translated = await asyncio.to_thread(
+                        mt_service.translate,
+                        text,
+                        source_lang,
+                        target_lang_param,
                     )
+                    if translated:
+                        payload["translation"] = translated
+                        payload["target_language"] = target_lang_param
+
+                if msg_type == "transcript":
+                    log_msg = (
+                        f"[{session_id}] Speech ended (duration: {duration}s) "
+                        f"lang={source_lang} text='{text}'"
+                    )
+                    if "translation" in payload:
+                        log_msg += f" -> [{target_lang_param}] '{payload['translation']}'"
+                    print(log_msg)
+
                 await _send_json_safe(payload)
         except Exception as e:
-            print(f"[{session_id}] ASR ({msg_type}) error: {e}")
+            print(f"[{session_id}] ASR/MT ({msg_type}) error: {e}")
 
-    print(f"[{session_id}] Client connected (language={lang_param or 'auto'})")
+    print(
+        f"[{session_id}] Client connected "
+        f"(language={lang_param or 'auto'}, target={target_lang_param or 'none'})"
+    )
 
     try:
         while True:
