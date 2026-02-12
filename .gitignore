@@ -52,6 +52,9 @@ frontend/node_modules/
 *.pt
 *.pth
 
+# CTranslate2 converted models
+backend/models/
+
 # Recordings (audio files)
 backend/recordings/*.wav
 backend/recordings/*.webm
