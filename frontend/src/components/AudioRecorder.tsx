@@ -1,321 +1,3 @@
-// /**
-//  * AudioRecorder
-//  *
-//  * Responsibilities:
-//  * - Request microphone access from the browser.
-//  * - Establish a WebSocket connection to the backend audio endpoint.
-//  * - Capture audio using MediaRecorder (WebM/Opus, ~250ms chunks) and stream
-//  *   chunks to the server in real time.
-//  * - Maintain simple recording state (idle/connecting/recording/error) and
-//  *   a human-friendly duration counter for the UI.
-//  * - Run a lightweight, client-side audio level detector using the Web Audio API
-//  *   (AnalyserNode) to drive a "Speaking..." indicator.
-//  *
-//  * Notes:
-//  * - The client-side speaking indicator is *not* Silero VAD. It is a simple
-//  *   energy-based heuristic that can be swapped out for a neural VAD
-//  *   implementation (e.g. @ricky0123/vad-web) in future phases, while keeping
-//  *   the rest of this component largely unchanged.
-//  */
-// import { useState, useRef, useCallback, useEffect } from 'react';
-
-// interface AudioRecorderProps {
-//     serverUrl?: string;
-// }
-
-// type RecordingState = 'idle' | 'recording' | 'connecting' | 'error';
-
-// export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: AudioRecorderProps) {
-//     const [state, setState] = useState<RecordingState>('idle');
-//     const [error, setError] = useState<string | null>(null);
-//     const [duration, setDuration] = useState(0);
-//     const [isSpeaking, setIsSpeaking] = useState(false);
-//     const [language, setLanguage] = useState<'auto' | 'en' | 'es' | 'pt'>('auto');
-//     const [transcripts, setTranscripts] = useState<string[]>([]);
-//     const [liveTranscript, setLiveTranscript] = useState<string>('');
-
-//     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-//     const websocketRef = useRef<WebSocket | null>(null);
-//     const streamRef = useRef<MediaStream | null>(null);
-//     const timerRef = useRef<number | null>(null);
-//     const analyserRef = useRef<AnalyserNode | null>(null);
-//     const animationFrameRef = useRef<number | null>(null);
-
-//     // Cleanup on unmount
-//     useEffect(() => {
-//         return () => {
-//             stopRecording();
-//         };
-//     }, []);
-
-//     // Simple audio level-based voice detection
-//     const startAudioAnalysis = useCallback((stream: MediaStream) => {
-//         const audioContext = new AudioContext();
-//         const source = audioContext.createMediaStreamSource(stream);
-//         const analyser = audioContext.createAnalyser();
-//         analyser.fftSize = 256;
-//         analyser.smoothingTimeConstant = 0.8;
-//         source.connect(analyser);
-//         analyserRef.current = analyser;
-
-//         const dataArray = new Uint8Array(analyser.frequencyBinCount);
-//         const speechThreshold = 30; // Adjust based on testing
-//         let speechFrames = 0;
-//         const speechFrameThreshold = 3;
-
-//         const analyze = () => {
-//             if (!analyserRef.current) return;
-
-//             analyserRef.current.getByteFrequencyData(dataArray);
-//             const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-
-//             if (average > speechThreshold) {
-//                 speechFrames++;
-//                 if (speechFrames >= speechFrameThreshold) {
-//                     setIsSpeaking(true);
-//                 }
-//             } else {
-//                 speechFrames = Math.max(0, speechFrames - 1);
-//                 if (speechFrames === 0) {
-//                     setIsSpeaking(false);
-//                 }
-//             }
-
-//             animationFrameRef.current = requestAnimationFrame(analyze);
-//         };
-
-//         analyze();
-//     }, []);
-
-//     const stopAudioAnalysis = useCallback(() => {
-//         if (animationFrameRef.current) {
-//             cancelAnimationFrame(animationFrameRef.current);
-//             animationFrameRef.current = null;
-//         }
-//         analyserRef.current = null;
-//         setIsSpeaking(false);
-//     }, []);
-
-//     const startRecording = useCallback(async () => {
-//         try {
-//             setError(null);
-//             setState('connecting');
-
-//             // Request microphone access
-//             const stream = await navigator.mediaDevices.getUserMedia({
-//                 audio: {
-//                     echoCancellation: true,
-//                     noiseSuppression: true,
-//                     sampleRate: 48000,
-//                 }
-//             });
-//             streamRef.current = stream;
-
-//             // Start audio level analysis for voice detection
-//             startAudioAnalysis(stream);
-
-//             // Connect to WebSocket server, optionally including language hint
-//             const langParam = language !== 'auto' ? `lang=${language}` : '';
-//             const wsUrl = langParam
-//                 ? `${serverUrl}${serverUrl.includes('?') ? '&' : '?'}${langParam}`
-//                 : serverUrl;
-//             const ws = new WebSocket(wsUrl);
-//             websocketRef.current = ws;
-
-//             ws.onopen = () => {
-//                 console.log('WebSocket connected');
-//                 // Clear previous transcripts for a fresh session
-//                 setTranscripts([]);
-
-//                 // Create MediaRecorder with WebM/Opus format
-//                 const mediaRecorder = new MediaRecorder(stream, {
-//                     mimeType: 'audio/webm;codecs=opus',
-//                     audioBitsPerSecond: 128000,
-//                 });
-//                 mediaRecorderRef.current = mediaRecorder;
-
-//                 // Send audio chunks to server
-//                 mediaRecorder.ondataavailable = (event) => {
-//                     if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-//                         ws.send(event.data);
-//                     }
-//                 };
-
-//                 mediaRecorder.onstop = () => {
-//                     console.log('MediaRecorder stopped');
-//                 };
-
-//                 // Start recording with 250ms chunks for real-time streaming
-//                 mediaRecorder.start(250);
-//                 setState('recording');
-//                 setDuration(0);
-
-//                 // Start duration timer
-//                 timerRef.current = window.setInterval(() => {
-//                     setDuration(d => d + 1);
-//                 }, 1000);
-//             };
-
-//             ws.onerror = (event) => {
-//                 console.error('WebSocket error:', event);
-//                 setError('Failed to connect to server');
-//                 setState('error');
-//                 cleanup();
-//             };
-
-//             ws.onclose = () => {
-//                 console.log('WebSocket closed');
-//                 if (state === 'recording') {
-//                     cleanup();
-//                     setState('idle');
-//                 }
-//             };
-
-//             ws.onmessage = (event) => {
-//                 // Server sends JSON messages with transcripts and metadata
-//                 if (typeof event.data === 'string') {
-//                     try {
-//                         const message = JSON.parse(event.data);
-//                         if (message?.type === 'transcript' && typeof message.text === 'string') {
-//                             // Final transcript for an utterance
-//                             setLiveTranscript('');
-//                             setTranscripts(prev => [...prev, message.text]);
-//                         } else if (message?.type === 'transcript_partial' && typeof message.text === 'string') {
-//                             // Live, non-final transcript while speaking
-//                             setLiveTranscript(message.text);
-//                         }
-//                     } catch (e) {
-//                         console.error('Failed to parse WebSocket message', e);
-//                     }
-//                 }
-//             };
-
-//         } catch (err) {
-//             console.error('Error starting recording:', err);
-//             setError(err instanceof Error ? err.message : 'Failed to access microphone');
-//             setState('error');
-//         }
-//     }, [serverUrl, state, startAudioAnalysis, language]);
-
-//     const cleanup = useCallback(() => {
-//         // Stop audio analysis
-//         stopAudioAnalysis();
-
-//         // Stop timer
-//         if (timerRef.current) {
-//             clearInterval(timerRef.current);
-//             timerRef.current = null;
-//         }
-
-//         // Stop MediaRecorder
-//         if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-//             mediaRecorderRef.current.stop();
-//         }
-//         mediaRecorderRef.current = null;
-
-//         // Stop media tracks
-//         if (streamRef.current) {
-//             streamRef.current.getTracks().forEach(track => track.stop());
-//         }
-//         streamRef.current = null;
-
-//         // Close WebSocket
-//         if (websocketRef.current) {
-//             websocketRef.current.close();
-//         }
-//         websocketRef.current = null;
-//     }, [stopAudioAnalysis]);
-
-//     const stopRecording = useCallback(() => {
-//         cleanup();
-//         setLiveTranscript('');
-//         setState('idle');
-//     }, [cleanup]);
-
-//     const formatDuration = (seconds: number): string => {
-//         const mins = Math.floor(seconds / 60);
-//         const secs = seconds % 60;
-//         return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-//     };
-
-//     return (
-//         <div className="audio-recorder">
-//             <div className="recorder-status">
-//                 {state === 'recording' && (
-//                     <div className="recording-indicator">
-//                         <span className={`pulse ${isSpeaking ? 'speaking' : ''}`}></span>
-//                         <span className="duration">{formatDuration(duration)}</span>
-//                         {isSpeaking && <span className="speaking-label">Speaking...</span>}
-//                     </div>
-//                 )}
-//                 {state === 'connecting' && (
-//                     <div className="connecting-indicator">Connecting...</div>
-//                 )}
-//                 {error && (
-//                     <div className="error-message">{error}</div>
-//                 )}
-//                 {(liveTranscript || transcripts.length > 0) && (
-//                     <div className="transcript-output">
-//                         <div className="transcript-label">Transcription:</div>
-//                         <div className="transcript-text">
-//                             {liveTranscript && (
-//                                 <div className="transcript-live">{liveTranscript}</div>
-//                             )}
-//                             {transcripts.map((t, idx) => (
-//                                 <div key={idx}>{t}</div>
-//                             ))}
-//                         </div>
-//                     </div>
-//                 )}
-//             </div>
-
-//             <div className="recorder-controls">
-//                 {state === 'idle' || state === 'error' ? (
-//                     <button
-//                         className="record-button start"
-//                         onClick={startRecording}
-//                     >
-//                         <svg viewBox="0 0 24 24" width="24" height="24">
-//                             <circle cx="12" cy="12" r="10" fill="currentColor" />
-//                         </svg>
-//                         Start Recording
-//                     </button>
-//                 ) : state === 'recording' ? (
-//                     <button
-//                         className="record-button stop"
-//                         onClick={stopRecording}
-//                     >
-//                         <svg viewBox="0 0 24 24" width="24" height="24">
-//                             <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
-//                         </svg>
-//                         Stop Recording
-//                     </button>
-//                 ) : (
-//                     <button className="record-button connecting" disabled>
-//                         Connecting...
-//                     </button>
-//                 )}
-//             </div>
-//             <div className="recorder-settings">
-//                 <label>
-//                     Language:&nbsp;
-//                     <select
-//                         value={language}
-//                         onChange={(e) => setLanguage(e.target.value as 'auto' | 'en' | 'es' | 'pt')}
-//                         disabled={state === 'recording' || state === 'connecting'}
-//                     >
-//                         <option value="auto">Auto-detect</option>
-//                         <option value="en">English</option>
-//                         <option value="es">Spanish</option>
-//                         <option value="pt">Portuguese</option>
-//                     </select>
-//                 </label>
-//             </div>
-//         </div>
-//     );
-// }
-
-
 /**
  * AudioRecorder
  *
@@ -346,6 +28,8 @@ interface TranscriptEntry {
     id: number;
     text: string;
     language: string;
+    translation?: string;
+    targetLanguage?: string;
     duration?: number;
     timestamp: Date;
 }
@@ -361,8 +45,13 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
     const [duration, setDuration] = useState(0);
     const [isSpeaking, setIsSpeaking] = useState(false);
     const [language, setLanguage] = useState<'auto' | 'en' | 'es' | 'pt'>('auto');
+    const [targetLanguage, setTargetLanguage] = useState<'none' | 'en' | 'es' | 'pt'>('es');
     const [transcripts, setTranscripts] = useState<TranscriptEntry[]>([]);
     const [liveTranscript, setLiveTranscript] = useState<string>('');
+    const [liveTranslation, setLiveTranslation] = useState<string>('');
+
+    const [ttsEnabled, setTtsEnabled] = useState(true);
+    const [isPlayingTts, setIsPlayingTts] = useState(false);
 
     /* ---- refs ---- */
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -373,6 +62,47 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
     const animationFrameRef = useRef<number | null>(null);
     const transcriptEndRef = useRef<HTMLDivElement | null>(null);
     const entryIdRef = useRef(0);
+    const ttsAudioCtxRef = useRef<AudioContext | null>(null);
+    const ttsQueueRef = useRef<ArrayBuffer[]>([]);
+    const ttsPlayingRef = useRef(false);
+
+    /* ---- TTS audio playback queue ---- */
+    const playNextTts = useCallback(async () => {
+        if (ttsPlayingRef.current) return;
+        const buf = ttsQueueRef.current.shift();
+        if (!buf) { setIsPlayingTts(false); return; }
+
+        ttsPlayingRef.current = true;
+        setIsPlayingTts(true);
+
+        try {
+            if (!ttsAudioCtxRef.current) {
+                ttsAudioCtxRef.current = new AudioContext();
+            }
+            const ctx = ttsAudioCtxRef.current;
+            if (ctx.state === 'suspended') await ctx.resume();
+
+            const decoded = await ctx.decodeAudioData(buf.slice(0));
+            const source = ctx.createBufferSource();
+            source.buffer = decoded;
+            source.connect(ctx.destination);
+            source.onended = () => {
+                ttsPlayingRef.current = false;
+                playNextTts();           // play next in queue
+            };
+            source.start();
+        } catch (e) {
+            console.error('TTS playback error:', e);
+            ttsPlayingRef.current = false;
+            setIsPlayingTts(false);
+            playNextTts();
+        }
+    }, []);
+
+    const enqueueTtsAudio = useCallback((data: ArrayBuffer) => {
+        ttsQueueRef.current.push(data);
+        playNextTts();
+    }, [playNextTts]);
 
     /* ---- auto-scroll transcript panel ---- */
     useEffect(() => {
@@ -437,9 +167,13 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
             streamRef.current = stream;
             startAudioAnalysis(stream);
 
-            const langParam = language !== 'auto' ? `lang=${language}` : '';
-            const wsUrl = langParam
-                ? `${serverUrl}${serverUrl.includes('?') ? '&' : '?'}${langParam}`
+            const params: string[] = [];
+            if (language !== 'auto') params.push(`lang=${language}`);
+            if (targetLanguage !== 'none') params.push(`target_lang=${targetLanguage}`);
+            if (!ttsEnabled) params.push('tts=false');
+            const queryStr = params.length > 0 ? params.join('&') : '';
+            const wsUrl = queryStr
+                ? `${serverUrl}${serverUrl.includes('?') ? '&' : '?'}${queryStr}`
                 : serverUrl;
             const ws = new WebSocket(wsUrl);
             websocketRef.current = ws;
@@ -477,12 +211,21 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
                 if (state === 'recording') { cleanup(); setState('idle'); }
             };
 
+            ws.binaryType = 'arraybuffer';
             ws.onmessage = (event) => {
+                // Binary message = TTS audio (WAV)
+                if (event.data instanceof ArrayBuffer) {
+                    enqueueTtsAudio(event.data);
+                    return;
+                }
+
+                // Text message = JSON transcript/translation
                 if (typeof event.data !== 'string') return;
                 try {
                     const msg = JSON.parse(event.data);
                     if (msg?.type === 'transcript' && typeof msg.text === 'string') {
                         setLiveTranscript('');
+                        setLiveTranslation('');
                         entryIdRef.current += 1;
                         setTranscripts(prev => [
                             ...prev,
@@ -490,12 +233,15 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
                                 id: entryIdRef.current,
                                 text: msg.text,
                                 language: msg.language ?? 'unknown',
+                                translation: msg.translation,
+                                targetLanguage: msg.target_language,
                                 duration: msg.duration,
                                 timestamp: new Date(),
                             },
                         ]);
                     } else if (msg?.type === 'transcript_partial' && typeof msg.text === 'string') {
                         setLiveTranscript(msg.text);
+                        setLiveTranslation(msg.translation ?? '');
                     }
                 } catch { /* ignore bad JSON */ }
             };
@@ -503,7 +249,7 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
             setError(err instanceof Error ? err.message : 'Failed to access microphone');
             setState('error');
         }
-    }, [serverUrl, state, startAudioAnalysis, language]);
+    }, [serverUrl, state, startAudioAnalysis, language, targetLanguage, ttsEnabled, enqueueTtsAudio]);
 
     const cleanup = useCallback(() => {
         stopAudioAnalysis();
@@ -519,6 +265,11 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
     const stopRecording = useCallback(() => {
         cleanup();
         setLiveTranscript('');
+        setLiveTranslation('');
+        // Clear TTS queue
+        ttsQueueRef.current = [];
+        ttsPlayingRef.current = false;
+        setIsPlayingTts(false);
         setState('idle');
     }, [cleanup]);
 
@@ -792,6 +543,28 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
                     color: #52525b;
                 }
 
+                /* translation row beneath transcript entry */
+                .ca-entry-translation {
+                    margin-top: 6px;
+                    padding: 8px 12px;
+                    background: rgba(99,102,241,0.08);
+                    border-left: 3px solid rgba(99,102,241,0.4);
+                    border-radius: 6px;
+                    font-size: 14px;
+                    line-height: 1.6;
+                    color: #a5b4fc;
+                    word-break: break-word;
+                }
+                .ca-entry-translation-label {
+                    font-family: 'JetBrains Mono', monospace;
+                    font-size: 10px;
+                    font-weight: 700;
+                    letter-spacing: 1.5px;
+                    text-transform: uppercase;
+                    color: #6366f1;
+                    margin-bottom: 2px;
+                }
+
                 /* live / partial transcript */
                 .ca-live {
                     display: flex;
@@ -818,6 +591,102 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
                     font-style: italic;
                     word-break: break-word;
                 }
+                .ca-live-translation {
+                    margin-top: 4px;
+                    padding: 6px 10px;
+                    background: rgba(99,102,241,0.06);
+                    border-left: 3px solid rgba(99,102,241,0.25);
+                    border-radius: 6px;
+                    font-size: 13px;
+                    line-height: 1.55;
+                    color: rgba(165,180,252,0.6);
+                    font-style: italic;
+                    word-break: break-word;
+                }
+
+                /* target language picker row */
+                .ca-lang-row {
+                    display: flex;
+                    gap: 16px;
+                    flex-wrap: wrap;
+                    align-items: center;
+                    justify-content: center;
+                }
+
+                /* TTS toggle */
+                .ca-tts-toggle {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    font-size: 13px;
+                    color: #71717a;
+                }
+                .ca-tts-toggle label {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    cursor: pointer;
+                }
+                .ca-tts-toggle input[type="checkbox"] {
+                    appearance: none;
+                    width: 36px; height: 20px;
+                    background: rgba(255,255,255,0.08);
+                    border-radius: 10px;
+                    position: relative;
+                    cursor: pointer;
+                    transition: background 0.2s;
+                }
+                .ca-tts-toggle input[type="checkbox"]::after {
+                    content: '';
+                    position: absolute;
+                    top: 2px; left: 2px;
+                    width: 16px; height: 16px;
+                    background: #71717a;
+                    border-radius: 50%;
+                    transition: transform 0.2s, background 0.2s;
+                }
+                .ca-tts-toggle input[type="checkbox"]:checked {
+                    background: rgba(99,102,241,0.3);
+                }
+                .ca-tts-toggle input[type="checkbox"]:checked::after {
+                    transform: translateX(16px);
+                    background: #6366f1;
+                }
+                .ca-tts-toggle input:disabled {
+                    opacity: 0.4;
+                    cursor: not-allowed;
+                }
+
+                /* TTS playing indicator */
+                .ca-tts-playing {
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                    font-family: 'JetBrains Mono', monospace;
+                    font-size: 11px;
+                    color: #22d3ee;
+                    letter-spacing: 1px;
+                    animation: ca-fade-in 0.2s ease-out;
+                }
+                .ca-tts-bars {
+                    display: flex;
+                    gap: 2px;
+                    align-items: flex-end;
+                    height: 14px;
+                }
+                .ca-tts-bar {
+                    width: 3px;
+                    background: #22d3ee;
+                    border-radius: 1px;
+                    animation: ca-bar-bounce 0.6s ease-in-out infinite;
+                }
+                .ca-tts-bar:nth-child(1) { height: 6px; animation-delay: 0s; }
+                .ca-tts-bar:nth-child(2) { height: 10px; animation-delay: 0.15s; }
+                .ca-tts-bar:nth-child(3) { height: 8px; animation-delay: 0.3s; }
+                @keyframes ca-bar-bounce {
+                    0%, 100% { transform: scaleY(0.5); }
+                    50% { transform: scaleY(1.2); }
+                }
 
                 /* ---------- responsive ---------- */
                 @media (max-width: 820px) {
@@ -839,7 +708,7 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
                 {/* ==================== LEFT: Controls ==================== */}
                 <div className="ca-controls">
                     <div className="ca-logo">CourtAccess AI</div>
-                    <div className="ca-tagline">Real-time speech transcription</div>
+                    <div className="ca-tagline">Real-time speech transcription &amp; translation</div>
 
                     {/* Status ring + timer */}
                     <div className="ca-ring-wrapper">
@@ -876,26 +745,70 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
                         <button className="ca-btn connecting" disabled>Connecting...</button>
                     )}
 
-                    {/* Language picker */}
-                    <div className="ca-lang-picker">
-                        <span>Language</span>
-                        <select
-                            value={language}
-                            onChange={(e) => setLanguage(e.target.value as 'auto' | 'en' | 'es' | 'pt')}
-                            disabled={state === 'recording' || state === 'connecting'}
-                        >
-                            <option value="auto">Auto-detect</option>
-                            <option value="en">English</option>
-                            <option value="es">Spanish</option>
-                            <option value="pt">Portuguese</option>
-                        </select>
+                    {/* Language pickers */}
+                    <div className="ca-lang-row">
+                        <div className="ca-lang-picker">
+                            <span>Source</span>
+                            <select
+                                value={language}
+                                onChange={(e) => setLanguage(e.target.value as 'auto' | 'en' | 'es' | 'pt')}
+                                disabled={state === 'recording' || state === 'connecting'}
+                            >
+                                <option value="auto">Auto-detect</option>
+                                <option value="en">English</option>
+                                <option value="es">Spanish</option>
+                                <option value="pt">Portuguese</option>
+                            </select>
+                        </div>
+                        <div className="ca-lang-picker">
+                            <span>Translate to</span>
+                            <select
+                                value={targetLanguage}
+                                onChange={(e) => setTargetLanguage(e.target.value as 'none' | 'en' | 'es' | 'pt')}
+                                disabled={state === 'recording' || state === 'connecting'}
+                            >
+                                <option value="none">Off</option>
+                                <option value="en">English</option>
+                                <option value="es">Spanish</option>
+                                <option value="pt">Portuguese</option>
+                            </select>
+                        </div>
                     </div>
+
+                    {/* TTS toggle */}
+                    {targetLanguage !== 'none' && (
+                        <div className="ca-tts-toggle">
+                            <label>
+                                <input
+                                    type="checkbox"
+                                    checked={ttsEnabled}
+                                    onChange={(e) => setTtsEnabled(e.target.checked)}
+                                    disabled={state === 'recording' || state === 'connecting'}
+                                />
+                                Speak translation
+                            </label>
+                        </div>
+                    )}
+
+                    {/* TTS playing indicator */}
+                    {isPlayingTts && (
+                        <div className="ca-tts-playing">
+                            <div className="ca-tts-bars">
+                                <div className="ca-tts-bar" />
+                                <div className="ca-tts-bar" />
+                                <div className="ca-tts-bar" />
+                            </div>
+                            Playing audio...
+                        </div>
+                    )}
                 </div>
 
                 {/* ==================== RIGHT: Transcript ==================== */}
                 <div className="ca-transcript-panel">
                     <div className="ca-transcript-header">
-                        <span className="ca-transcript-title">Live Transcript</span>
+                        <span className="ca-transcript-title">
+                            {targetLanguage !== 'none' ? 'Transcript & Translation' : 'Live Transcript'}
+                        </span>
                         {transcripts.length > 0 && (
                             <span className="ca-transcript-count">
                                 {transcripts.length} utterance{transcripts.length !== 1 ? 's' : ''}
@@ -921,8 +834,17 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
                                         <div className="ca-entry-dot" />
                                         <div className="ca-entry-content">
                                             <div className="ca-entry-text">{entry.text}</div>
+                                            {entry.translation && (
+                                                <div className="ca-entry-translation">
+                                                    <div className="ca-entry-translation-label">
+                                                        {langLabel[entry.targetLanguage ?? ''] ?? entry.targetLanguage?.toUpperCase() ?? 'Translation'}
+                                                    </div>
+                                                    {entry.translation}
+                                                </div>
+                                            )}
                                             <div className="ca-entry-meta">
                                                 <span>{langLabel[entry.language] ?? entry.language.toUpperCase()}</span>
+                                                {entry.targetLanguage && <span>→ {langLabel[entry.targetLanguage] ?? entry.targetLanguage.toUpperCase()}</span>}
                                                 {entry.duration != null && <span>{entry.duration}s</span>}
                                                 <span>
                                                     {entry.timestamp.toLocaleTimeString([], {
@@ -940,7 +862,12 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
                                 {liveTranscript && (
                                     <div className="ca-live">
                                         <div className="ca-live-dot" />
-                                        <div className="ca-live-text">{liveTranscript}</div>
+                                        <div style={{ flex: 1 }}>
+                                            <div className="ca-live-text">{liveTranscript}</div>
+                                            {liveTranslation && (
+                                                <div className="ca-live-translation">{liveTranslation}</div>
+                                            )}
+                                        </div>
                                     </div>
                                 )}
                             </>
