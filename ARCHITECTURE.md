@@ -1,8 +1,9 @@
 ## Audio Streaming POC – Architecture Overview
 
 This document explains how audio flows from the browser to the backend, how
-Voice Activity Detection (VAD) and Automatic Speech Recognition (ASR) are
-integrated, and where future components (LLM, TTS, barge-in) will plug in.
+Voice Activity Detection (VAD), Automatic Speech Recognition (ASR), Machine
+Translation (MT), and Text-to-Speech (TTS) are integrated, and where future
+components (LLM, barge-in) will plug in.
 
 ### High-level flow
 
@@ -12,7 +13,11 @@ integrated, and where future components (LLM, TTS, barge-in) will plug in.
   - Streams encoded chunks to the backend over a WebSocket.
   - Receives JSON messages (`transcript`, `transcript_partial`) back from the
     server over the same WebSocket and renders them in a live transcript panel.
+  - Receives binary WebSocket frames containing TTS WAV audio and plays them
+    back via `AudioContext` with a sequential queue.
   - Shows a client-side speaking indicator based on audio energy level.
+  - Displays live translations alongside transcripts when a target language is
+    selected.
 
 - **Backend (FastAPI)**
   - Exposes a WebSocket endpoint at `/ws/audio`.
@@ -23,7 +28,12 @@ integrated, and where future components (LLM, TTS, barge-in) will plug in.
   - Uses silence-based logic to detect speech start/end events.
   - On `speech_end`, runs Faster-Whisper ASR in a **background thread**
     (`asyncio.to_thread`) so the receive loop is never blocked.
-  - Sends partial and final transcripts back to the browser as JSON.
+  - After ASR, optionally translates the text via NLLB-200 (CTranslate2) when
+    a `target_lang` is specified and differs from the source language.
+  - After translation, optionally synthesizes speech via Piper TTS and sends
+    the resulting WAV audio back as a binary WebSocket frame.
+  - Sends partial and final transcripts (with translations) back to the browser
+    as JSON.
   - Saves each WebSocket session as a `.wav` file for debugging/verification.
 
 ---
@@ -63,10 +73,14 @@ integrated, and where future components (LLM, TTS, barge-in) will plug in.
 Split-screen design:
 
 - **Left panel** – recording controls, status ring with timer, speaking
-  indicator, start/stop button, language selector.
-- **Right panel** – scrollable live transcript with finalized utterance entries
-  (text, language badge, duration, timestamp) and a faded partial-text line
-  while the user is still speaking. Auto-scrolls as new entries arrive.
+  indicator, start/stop button, source language selector, target language
+  selector, and TTS toggle.
+- **Right panel** – scrollable transcript panel with finalized utterance entries
+  (original text, language badge, duration, timestamp). When translation is
+  active, translated text is shown below each entry. A faded partial-text line
+  (with live translation) appears while the user is still speaking.
+  Auto-scrolls as new entries arrive. An animated "Playing audio..." indicator
+  appears when TTS audio is being played.
 
 ### 1.4 Client-side speaking indicator
 
@@ -86,10 +100,12 @@ Split-screen design:
 File: `backend/api/main.py`
 
 - Creates the FastAPI app with permissive CORS for local development.
-- On startup, eagerly loads both models:
+- On startup, eagerly loads all models:
   - `get_vad_service()` – Silero VAD.
-  - `get_asr_service()` – Faster-Whisper (large-v3-turbo or model set via
-    `WHISPER_MODEL` env var).
+  - `get_asr_service()` – Faster-Whisper (model set via `WHISPER_MODEL` env
+    var, default `small`).
+  - `get_mt_service()` – NLLB-200 via CTranslate2.
+  - `get_tts_service()` – Piper TTS voices for en, es, pt.
 - Provides:
   - `GET /` – Health check.
   - `GET /recordings` – Lists saved `.wav` recordings.
@@ -99,8 +115,12 @@ File: `backend/api/main.py`
 
 Function: `audio_websocket`
 
-Accepts an optional `?lang=en|es|pt` query parameter to force a transcription
-language (otherwise Faster-Whisper auto-detects).
+Accepts optional query parameters:
+- `?lang=en|es|pt` – force a transcription language (otherwise Faster-Whisper
+  auto-detects).
+- `?target_lang=en|es|pt` – target language for translation. If omitted or
+  same as source, translation is skipped.
+- `?tts=true|false` – enable TTS synthesis of translated text (default false).
 
 For each client connection:
 
@@ -124,12 +144,24 @@ For each client connection:
    - Convert accumulated WebM data to `.wav` and save under
      `backend/recordings/{session_id}.wav`.
 
-#### JSON messages sent to the browser
+#### Messages sent to the browser
 
-| `type`               | Fields                                           | When                        |
-|----------------------|--------------------------------------------------|-----------------------------|
-| `transcript`         | `session_id`, `text`, `language`, `duration`     | After each utterance ends   |
-| `transcript_partial` | `session_id`, `text`, `language`                 | Periodically while speaking |
+**JSON (text frames):**
+
+| `type`               | Fields                                                                                    | When                        |
+|----------------------|-------------------------------------------------------------------------------------------|-----------------------------|
+| `transcript`         | `session_id`, `text`, `language`, `duration`, `translation`, `target_language`, `has_tts_audio` | After each utterance ends   |
+| `transcript_partial` | `session_id`, `text`, `language`, `translation`, `target_language`                        | Periodically while speaking |
+
+- `translation` and `target_language` are present only when a target language is
+  configured and differs from the source.
+- `has_tts_audio` is `true` when TTS is enabled and a binary WAV frame follows.
+
+**Binary (binary frames):**
+
+- WAV audio generated by Piper TTS. Sent immediately after the corresponding
+  `transcript` JSON message when `has_tts_audio` is true. The frontend
+  distinguishes JSON vs binary by checking `instanceof ArrayBuffer`.
 
 ### 2.3 `AudioSession`
 
@@ -252,54 +284,122 @@ continuously.
 
 ---
 
-## 5. Extension points for future phases
+## 5. Machine Translation — Phase 4, implemented
 
-### 5.1 LLM-based conversational logic
+### 5.1 `MTService` (NLLB-200 via CTranslate2)
 
-After ASR produces a final transcript on `speech_end`:
+File: `backend/services/mt_service.py`
+
+- Singleton loaded on startup via `get_mt_service()`.
+- Uses the NLLB-200-distilled-1.3B model, converted to CTranslate2 format with
+  int8 quantization for efficient CPU inference.
+- On first load, downloads the Hugging Face model and runs
+  `ct2-transformers-converter` to produce the CTranslate2 model directory under
+  `backend/models/nllb-200-distilled-1.3B-ct2-int8/`.
+- Maintains a language code mapping from ISO 639-1 (`en`, `es`, `pt`) to
+  NLLB Flores-200 codes (`eng_Latn`, `spa_Latn`, `por_Latn`).
+- `translate(text, source_lang, target_lang) -> str`:
+  - Tokenizes input with the NLLB tokenizer, setting the source language as the
+    `src_lang`.
+  - Translates via `ctranslate2.Translator` with a target prefix token for the
+    target language.
+  - Filters special tokens (`</s>`, `<unk>`) before decoding the output.
+
+### 5.2 How MT integrates with the pipeline
+
+After ASR produces a transcript (partial or final), if a `target_lang` is
+configured and differs from the detected source language:
+
+1. `mt_service.translate(text, source_lang, target_lang)` runs in
+   `asyncio.to_thread`.
+2. The resulting translation is included in the JSON response alongside the
+   original transcript text.
+3. For partial transcripts, translation is sent as `translation` in the
+   `transcript_partial` message for live display.
+
+---
+
+## 6. Text-to-Speech — Phase 5, implemented
+
+### 6.1 `TTSService` (Piper TTS)
+
+File: `backend/services/tts_service.py`
+
+- Singleton loaded on startup via `get_tts_service()`.
+- Uses Piper TTS with ONNX voice models downloaded from the `rhasspy/piper-voices`
+  Hugging Face repository (v1.0.0 branch).
+- Voices loaded per language:
+  - `en` → `en_US-lessac-medium`
+  - `es` → `es_ES-sharvard-medium`
+  - `pt` → `pt_BR-faber-medium`
+- `synthesize(text, language, length_scale, sentence_silence) -> bytes`:
+  - Returns WAV audio bytes using `PiperVoice.synthesize_wav()`.
+  - Configurable speaking rate (`length_scale`) and pause between sentences
+    (`sentence_silence`).
+
+### 6.2 How TTS integrates with the pipeline
+
+On final transcripts, if TTS is enabled and a translation was produced:
+
+1. `tts_service.synthesize(translated_text, target_lang)` runs in
+   `asyncio.to_thread`.
+2. The JSON transcript message is sent first with `has_tts_audio: true`.
+3. The WAV bytes are sent as a binary WebSocket frame immediately after.
+
+### 6.3 Frontend audio playback
+
+- The frontend sets `binaryType = 'arraybuffer'` on the WebSocket.
+- Binary frames are enqueued in a `ttsQueueRef`.
+- `playNextTts()` decodes WAV data via `AudioContext.decodeAudioData`, creates a
+  `BufferSourceNode`, and plays it. When playback ends, the next item in the
+  queue is played automatically.
+- A "Playing audio..." indicator is shown while TTS audio is active.
+- The TTS toggle in the UI controls whether `?tts=true` is sent to the server.
+
+---
+
+## 7. Extension points for future phases
+
+### 7.1 LLM-based conversational logic
+
+After ASR + MT produce a transcript and translation:
 
 - A conversation manager could maintain dialog state, call an LLM (local or
-  remote), and produce a text response for TTS.
-- This would plug in right after the `"transcript"` message is sent — or
-  replace it with a richer response that includes both the transcript and the
-  LLM reply.
+  remote), and produce a text response.
+- This would plug in after translation, optionally replacing or augmenting the
+  translated text before TTS.
 
-### 5.2 Piper TTS and audio streaming back to the client
-
-- Piper TTS is already in backend dependencies (unused so far).
-- After generating a text response, run TTS to synthesize audio.
-- Stream synthesized audio back over the same WebSocket as binary messages.
-- On the frontend, create a player component that receives audio chunks and
-  plays them via `AudioContext` or `MediaSource`.
-
-### 5.3 Barge-in (interrupting TTS when the user speaks)
+### 7.2 Barge-in (interrupting TTS when the user speaks)
 
 - Use **server-side** Silero VAD (existing) plus **client-side** VAD (to be
   upgraded from the current energy-based detector).
 - While TTS is playing, if the user starts speaking:
-  - Immediately stop or attenuate TTS playback on the client.
+  - Immediately stop TTS playback on the client and clear the audio queue.
   - Optionally send a control message to the server to cancel ongoing TTS.
-- The current `isSpeaking` indicator is a natural hook for this.
+- The current `isSpeaking` indicator and `ttsQueueRef` are natural hooks for
+  this.
 
 ---
 
-## 6. File index
+## 8. File index
 
 - **Frontend**
   - `frontend/src/main.tsx` – React entrypoint.
   - `frontend/src/App.tsx` – App shell.
   - `frontend/src/components/AudioRecorder.tsx` – Microphone capture,
-    MediaRecorder, WebSocket client, split-screen transcript UI.
+    MediaRecorder, WebSocket client, translation display, TTS audio playback,
+    split-screen transcript UI.
 
 - **Backend**
   - `backend/api/main.py`
     - FastAPI app and CORS.
-    - WebSocket endpoint `/ws/audio` (bidirectional: audio in, JSON out).
+    - WebSocket endpoint `/ws/audio` (bidirectional: audio + JSON in,
+      JSON + binary out).
     - `AudioStreamDecoder` – WebM/Opus → PCM decoder (dedup via
       `_samples_returned`).
     - `AudioSession` – per-connection state (chunks, VAD, utterance PCM
       accumulation, WAV saving).
-    - Non-blocking ASR dispatch via `asyncio.create_task` +
+    - Non-blocking ASR/MT/TTS dispatch via `asyncio.create_task` +
       `asyncio.to_thread`.
     - Health and recordings listing endpoints.
   - `backend/services/vad/vad_service.py`
@@ -308,3 +408,12 @@ After ASR produces a final transcript on `speech_end`:
   - `backend/services/asr_service.py`
     - `ASRService` – Faster-Whisper model wrapper (singleton).
     - `get_asr_service()` – global accessor.
+  - `backend/services/mt_service.py`
+    - `MTService` – NLLB-200 CTranslate2 translator (singleton).
+    - `get_mt_service()` – global accessor.
+    - Language code mapping (ISO 639-1 → NLLB Flores-200).
+  - `backend/services/tts_service.py`
+    - `TTSService` – Piper TTS voice manager (singleton).
+    - `get_tts_service()` – global accessor.
+    - Per-language voice model downloading and loading.
+  - `backend/models/` – Downloaded model files (gitignored).
