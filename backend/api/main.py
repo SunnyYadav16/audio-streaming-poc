@@ -389,250 +389,6 @@ async def startup_event():
     print("[API] TTS voices ready")
 
 
-# @app.websocket("/ws/audio")
-# async def audio_websocket(websocket: WebSocket):
-#     """WebSocket endpoint for receiving audio streams with VAD and ASR.
-
-#     VAD runs inline (fast). ASR runs in background threads so the receive
-#     loop is never blocked and audio flows continuously.
-#     """
-#     await websocket.accept()
-
-#     # Optional language selection from query params (en, es, pt or auto-detect)
-#     lang_param = websocket.query_params.get("lang")
-#     if lang_param not in {"en", "es", "pt"}:
-#         lang_param = None
-
-#     # Optional target language for machine translation
-#     target_lang_param = websocket.query_params.get("target_lang")
-#     if target_lang_param not in {"en", "es", "pt"}:
-#         target_lang_param = None
-
-#     # Optional TTS toggle (enabled by default when translation is active)
-#     tts_enabled = websocket.query_params.get("tts", "true").lower() != "false"
-
-#     session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-#     session = AudioSession(session_id, language=lang_param)
-#     sessions[session_id] = session
-#     asr_service = get_asr_service()
-#     mt_service = get_mt_service() if target_lang_param else None
-#     tts_service = get_tts_service() if (target_lang_param and tts_enabled) else None
-
-#     # Track background ASR tasks so we can clean up on disconnect
-#     background_tasks: list[asyncio.Task] = []
-#     # Track the current partial-ASR task (only one at a time)
-#     partial_task: Optional[asyncio.Task] = None
-#     # Monotonic counter to discard stale partial results
-#     utterance_id = 0
-#     ws_open = True
-
-#     async def _send_json_safe(payload: dict):
-#         """Send JSON to the browser, swallowing errors if the socket closed."""
-#         nonlocal ws_open
-#         if not ws_open:
-#             return
-#         try:
-#             await websocket.send_json(payload)
-#         except Exception:
-#             ws_open = False
-
-#     async def _send_bytes_safe(data: bytes):
-#         """Send binary data to the browser, swallowing errors if closed."""
-#         nonlocal ws_open
-#         if not ws_open:
-#             return
-#         try:
-#             await websocket.send_bytes(data)
-#         except Exception:
-#             ws_open = False
-
-#     async def _run_asr_and_send(
-#         pcm: np.ndarray,
-#         msg_type: str,
-#         utt_id: int,
-#         duration: Optional[float] = None,
-#     ):
-#         """Run Whisper in a worker thread, optionally translate, and send."""
-#         try:
-#             text, used_lang = await asyncio.to_thread(
-#                 asr_service.transcribe, pcm, lang_param,
-#             )
-#             # Discard stale partials (utterance already ended)
-#             if msg_type == "transcript_partial" and utt_id != utterance_id:
-#                 return
-#             if text:
-#                 source_lang = used_lang or lang_param or "unknown"
-#                 payload: dict = {
-#                     "type": msg_type,
-#                     "session_id": session_id,
-#                     "text": text,
-#                     "language": source_lang,
-#                 }
-#                 if duration is not None:
-#                     payload["duration"] = duration
-
-#                 # --- Machine Translation (if target language is set) ---
-#                 if (
-#                     mt_service is not None
-#                     and target_lang_param
-#                     and source_lang != target_lang_param
-#                     and source_lang != "unknown"
-#                 ):
-#                     translated = await asyncio.to_thread(
-#                         mt_service.translate,
-#                         text,
-#                         source_lang,
-#                         target_lang_param,
-#                     )
-#                     if translated:
-#                         payload["translation"] = translated
-#                         payload["target_language"] = target_lang_param
-
-#                 # --- TTS (only for final transcripts with a translation) ---
-#                 # tts_wav: bytes = b""
-#                 # if (
-#                 #     msg_type == "transcript"
-#                 #     and tts_service is not None
-#                 #     and target_lang_param
-#                 #     and payload.get("translation")
-#                 # ):
-#                 #     tts_wav = await asyncio.to_thread(
-#                 #         tts_service.synthesize,
-#                 #         payload["translation"],
-#                 #         target_lang_param,
-#                 #     )
-#                 #     if tts_wav:
-#                 #         payload["has_tts_audio"] = True
-#                 tts_wav: bytes = b""
-#                 if (
-#                     msg_type == "transcript"
-#                     and tts_service is not None
-#                     and target_lang_param
-#                     and payload.get("translation")
-#                 ):
-#                     tts_wav = await asyncio.to_thread(
-#                         tts_service.synthesize,
-#                         payload["translation"],
-#                         target_lang_param,
-#                     )
-#                     if tts_wav:
-#                         # Save TTS audio to disk for verification
-#                         tts_dir = Path(__file__).parent.parent / "recordings" / "tts"
-#                         tts_dir.mkdir(parents=True, exist_ok=True)
-#                         tts_path = tts_dir / f"{session_id}_utt{utt_id}_{target_lang_param}.wav"
-#                         tts_path.write_bytes(tts_wav)
-#                         payload["tts_saved"] = str(tts_path)
-
-#                 # if msg_type == "transcript":
-#                 #     log_msg = (
-#                 #         f"[{session_id}] Speech ended (duration: {duration}s) "
-#                 #         f"lang={source_lang} text='{text}'"
-#                 #     )
-#                 #     if "translation" in payload:
-#                 #         log_msg += f" -> [{target_lang_param}] '{payload['translation']}'"
-#                 #     if tts_wav:
-#                 #         log_msg += f" [TTS {len(tts_wav)} bytes]"
-#                 #     print(log_msg)
-#                 if msg_type == "transcript":
-#                     log_msg = (
-#                         f"[{session_id}] Speech ended (duration: {duration}s) "
-#                         f"lang={source_lang} text='{text}'"
-#                     )
-#                     if "translation" in payload:
-#                         log_msg += f" -> [{target_lang_param}] '{payload['translation']}'"
-#                     if tts_wav:
-#                         log_msg += f" [TTS saved: {payload['tts_saved']}]"
-#                     print(log_msg)
-
-#                 await _send_json_safe(payload)
-
-#                 # Send TTS WAV as a binary frame right after the JSON
-#                 if tts_wav:
-#                     await _send_bytes_safe(tts_wav)
-#         except Exception as e:
-#             print(f"[{session_id}] ASR/MT ({msg_type}) error: {e}")
-
-#     print(
-#         f"[{session_id}] Client connected "
-#         f"(language={lang_param or 'auto'}, target={target_lang_param or 'none'}, "
-#         f"tts={'on' if tts_service else 'off'})"
-#     )
-
-#     try:
-#         while True:
-#             data = await websocket.receive_bytes()
-#             session.add_chunk(data)
-
-#             # VAD processing — fast, never blocks
-#             events = session.process_for_vad(data)
-
-#             for event in events:
-#                 if event["type"] == "speech_start":
-#                     print(f"[{session_id}] 🎤 Speech started")
-#                     utterance_id += 1
-#                     # Cancel any in-flight partial for the previous utterance
-#                     if partial_task and not partial_task.done():
-#                         partial_task.cancel()
-#                         partial_task = None
-
-#                 elif event["type"] == "speech_end":
-#                     # Cancel any in-flight partial
-#                     if partial_task and not partial_task.done():
-#                         partial_task.cancel()
-#                         partial_task = None
-
-#                     utterance_pcm = event.get("utterance_pcm")
-#                     duration = event.get("duration")
-#                     if utterance_pcm is not None and utterance_pcm.size > 0:
-#                         task = asyncio.create_task(
-#                             _run_asr_and_send(
-#                                 utterance_pcm, "transcript", utterance_id, duration
-#                             )
-#                         )
-#                         background_tasks.append(task)
-
-#             # --- Periodic partial transcript while user is speaking ---
-#             # Fire a partial only when:
-#             #   - the user is actively speaking
-#             #   - we have at least ~1 second of utterance audio
-#             #   - no other partial is already in flight
-#             MIN_PARTIAL_SAMPLES = int(VAD_SAMPLE_RATE * 1.0)  # 1 second
-#             if (
-#                 session.segment_detector.is_speaking
-#                 and session.current_utterance_pcm.size >= MIN_PARTIAL_SAMPLES
-#                 and (partial_task is None or partial_task.done())
-#             ):
-#                 partial_task = asyncio.create_task(
-#                     _run_asr_and_send(
-#                         session.current_utterance_pcm.copy(),
-#                         "transcript_partial",
-#                         utterance_id,
-#                     )
-#                 )
-#                 background_tasks.append(partial_task)
-
-#     except WebSocketDisconnect:
-#         print(f"[{session_id}] Client disconnected")
-#     except Exception as e:
-#         print(f"[{session_id}] Error: {e}")
-#         import traceback
-#         traceback.print_exc()
-#     finally:
-#         ws_open = False
-#         # Cancel any in-flight ASR tasks
-#         for t in background_tasks:
-#             if not t.done():
-#                 t.cancel()
-#         # Save the full recording
-#         if session.chunks:
-#             output_path = session.save_as_wav()
-#             if output_path:
-#                 print(f"[{session_id}] Saved recording to {output_path}")
-#             else:
-#                 print(f"[{session_id}] Failed to save recording")
-
-#         sessions.pop(session_id, None)
-
 @app.websocket("/ws/audio")
 async def audio_websocket(websocket: WebSocket):
     """WebSocket endpoint for receiving audio streams with VAD and ASR.
@@ -820,6 +576,9 @@ async def audio_websocket(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print(f"[{session_id}] Client disconnected")
+    except RuntimeError as e:
+        # Starlette raises RuntimeError when receive() is called after disconnect
+        print(f"[{session_id}] Client disconnected (ws closed)")
     except Exception as e:
         print(f"[{session_id}] Error: {e}")
         import traceback
@@ -1247,6 +1006,11 @@ async def session_websocket(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print(f"[Room {room_id}] [{user_name}] Disconnected")
+    except RuntimeError as e:
+        # Starlette raises RuntimeError (not WebSocketDisconnect) when
+        # receive() is called after a disconnect message was already
+        # consumed internally.  This is a normal disconnect — not a bug.
+        print(f"[Room {room_id}] [{user_name}] Disconnected (ws closed)")
     except Exception as e:
         print(f"[Room {room_id}] [{user_name}] Error: {e}")
         import traceback
