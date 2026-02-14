@@ -20,6 +20,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 
 interface AudioRecorderProps {
     serverUrl?: string;
+    onBack?: () => void;
 }
 
 type RecordingState = 'idle' | 'recording' | 'connecting' | 'error';
@@ -38,7 +39,7 @@ interface TranscriptEntry {
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
 
-export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: AudioRecorderProps) {
+export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio', onBack }: AudioRecorderProps) {
     /* ---- state ---- */
     const [state, setState] = useState<RecordingState>('idle');
     const [error, setError] = useState<string | null>(null);
@@ -707,6 +708,25 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio' }: Au
             <div className="ca-root">
                 {/* ==================== LEFT: Controls ==================== */}
                 <div className="ca-controls">
+                    {onBack && (
+                        <button
+                            onClick={onBack}
+                            style={{
+                                position: 'absolute', top: 16, left: 16,
+                                background: 'none', border: 'none', color: '#71717a',
+                                fontSize: 13, cursor: 'pointer', display: 'flex',
+                                alignItems: 'center', gap: 4, padding: '6px 10px',
+                                borderRadius: 6, transition: 'all 0.2s',
+                            }}
+                            onMouseEnter={e => { e.currentTarget.style.color = '#e4e4e7'; e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; }}
+                            onMouseLeave={e => { e.currentTarget.style.color = '#71717a'; e.currentTarget.style.background = 'none'; }}
+                        >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M19 12H5" /><path d="M12 19l-7-7 7-7" />
+                            </svg>
+                            Back
+                        </button>
+                    )}
                     <div className="ca-logo">CourtAccess AI</div>
                     <div className="ca-tagline">Real-time speech transcription &amp; translation</div>
 
