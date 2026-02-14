@@ -83,6 +83,8 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
     const ttsAudioCtxRef = useRef<AudioContext | null>(null);
     const ttsQueueRef = useRef<ArrayBuffer[]>([]);
     const ttsPlayingRef = useRef(false);
+    const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null);   // current playing source (for barge-in stop)
+    const bargeInSentRef = useRef(false);                               // guard: prevent double interrupt sends
 
     /* ---- TTS playback queue ---- */
     const playNextTts = useCallback(async () => {
@@ -102,13 +104,16 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
             const source = ctx.createBufferSource();
             source.buffer = decoded;
             source.connect(ctx.destination);
+            ttsSourceRef.current = source;          // store ref for barge-in
             source.onended = () => {
+                ttsSourceRef.current = null;
                 ttsPlayingRef.current = false;
                 playNextTts();
             };
             source.start();
         } catch (e) {
             console.error('TTS playback error:', e);
+            ttsSourceRef.current = null;
             ttsPlayingRef.current = false;
             setIsPlayingTts(false);
             playNextTts();
@@ -119,6 +124,66 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
         ttsQueueRef.current.push(data);
         playNextTts();
     }, [playNextTts]);
+
+    /* ---- barge-in: instant TTS stop ---- */
+    const stopTtsPlayback = useCallback(() => {
+        // Stop the currently playing source node immediately
+        if (ttsSourceRef.current) {
+            try { ttsSourceRef.current.stop(); } catch { /* already stopped */ }
+            ttsSourceRef.current = null;
+        }
+        // Flush the queue
+        ttsQueueRef.current = [];
+        ttsPlayingRef.current = false;
+        setIsPlayingTts(false);
+    }, []);
+
+    /* ---- barge-in detection ---- */
+    // Require sustained speech (BARGE_IN_DELAY_MS) before firing the
+    // interrupt.  This avoids false barge-ins from transient noise like
+    // coughs, door slams, or paper shuffling — important in a courtroom.
+    const BARGE_IN_DELAY_MS = 300;
+    const bargeInTimerRef = useRef<number | null>(null);
+
+    useEffect(() => {
+        // Conditions met: user is speaking during TTS playback
+        if (isSpeaking && isPlayingTts && !bargeInSentRef.current) {
+            // Start a confirmation timer — only fire if speech is sustained
+            if (bargeInTimerRef.current === null) {
+                bargeInTimerRef.current = window.setTimeout(() => {
+                    bargeInTimerRef.current = null;
+
+                    // Re-check conditions (speech might have stopped during the delay)
+                    if (!ttsPlayingRef.current || bargeInSentRef.current) return;
+
+                    console.log('[Barge-in] Sustained speech detected during TTS — interrupting');
+                    bargeInSentRef.current = true;
+
+                    // 8.2: Instant audio ducking — stop TTS in 0 ms
+                    stopTtsPlayback();
+
+                    // Clear echo-suppression lock on the UI
+                    setMicLocked(false);
+
+                    // 8.3: Send INTERRUPT_SIGNAL to server
+                    if (wsRef.current?.readyState === WebSocket.OPEN) {
+                        wsRef.current.send(JSON.stringify({ type: 'interrupt' }));
+                    }
+                }, BARGE_IN_DELAY_MS);
+            }
+        } else {
+            // Speech stopped or TTS ended before the delay elapsed — cancel
+            if (bargeInTimerRef.current !== null) {
+                clearTimeout(bargeInTimerRef.current);
+                bargeInTimerRef.current = null;
+            }
+        }
+
+        // Reset guard when TTS is no longer playing (natural end or barge-in)
+        if (!isPlayingTts) {
+            bargeInSentRef.current = false;
+        }
+    }, [isSpeaking, isPlayingTts, stopTtsPlayback]);
 
     /* ---- auto-scroll ---- */
     useEffect(() => {
@@ -178,8 +243,18 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
         streamRef.current = null;
         wsRef.current?.close();
         wsRef.current = null;
+        // Stop any playing TTS and clear queue
+        if (ttsSourceRef.current) {
+            try { ttsSourceRef.current.stop(); } catch { /* already stopped */ }
+            ttsSourceRef.current = null;
+        }
         ttsQueueRef.current = [];
         ttsPlayingRef.current = false;
+        bargeInSentRef.current = false;
+        if (bargeInTimerRef.current !== null) {
+            clearTimeout(bargeInTimerRef.current);
+            bargeInTimerRef.current = null;
+        }
         setIsPlayingTts(false);
         setIsRecording(false);
     }, [stopAudioAnalysis]);
@@ -205,7 +280,8 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                 params.set('partner_lang', opts.partnerLang || 'es');
             }
             params.set('name', opts.name || 'User');
-            const wsUrl = `ws://localhost:8000/ws/session?${params.toString()}`;
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${wsProtocol}//${window.location.host}/ws/session?${params.toString()}`;
 
             const ws = new WebSocket(wsUrl);
             wsRef.current = ws;

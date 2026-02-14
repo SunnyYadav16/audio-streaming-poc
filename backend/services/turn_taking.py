@@ -180,6 +180,26 @@ class TurnStateMachine:
         total_ms = duration_ms + self.lockout_buffer_ms
         self._lockout[role] = time.monotonic() + total_ms / 1000.0
 
+    def on_interrupt(self, interrupter_role: str):
+        """
+        Handle barge-in: give the floor to the interrupter immediately.
+
+        Called when a user starts speaking while TTS is playing on their
+        end.  Clears their echo-suppression lockout and grants them the
+        floor so that the in-progress ``speech_end`` event from the VAD
+        will be properly accepted and routed through ASR → MT → TTS.
+        """
+        # Clear interrupter's echo lockout
+        self._lockout[interrupter_role] = 0.0
+
+        # Give the floor directly to the interrupter
+        self._floor_holder = interrupter_role
+        self._grace_expiry = 0.0
+        self.state = (
+            FloorState.A_SPEAKING if interrupter_role == "a"
+            else FloorState.B_SPEAKING
+        )
+
     # ------------------------------------------------------------------ #
     #  Diagnostics                                                         #
     # ------------------------------------------------------------------ #

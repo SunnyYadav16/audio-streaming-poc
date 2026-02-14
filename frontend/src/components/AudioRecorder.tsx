@@ -39,7 +39,9 @@ interface TranscriptEntry {
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
 
-export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio', onBack }: AudioRecorderProps) {
+export function AudioRecorder({ serverUrl, onBack }: AudioRecorderProps) {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const effectiveServerUrl = serverUrl ?? `${protocol}//${window.location.host}/ws/audio`;
     /* ---- state ---- */
     const [state, setState] = useState<RecordingState>('idle');
     const [error, setError] = useState<string | null>(null);
@@ -174,8 +176,8 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio', onBa
             if (!ttsEnabled) params.push('tts=false');
             const queryStr = params.length > 0 ? params.join('&') : '';
             const wsUrl = queryStr
-                ? `${serverUrl}${serverUrl.includes('?') ? '&' : '?'}${queryStr}`
-                : serverUrl;
+                ? `${effectiveServerUrl}${effectiveServerUrl.includes('?') ? '&' : '?'}${queryStr}`
+                : effectiveServerUrl;
             const ws = new WebSocket(wsUrl);
             websocketRef.current = ws;
 
@@ -250,7 +252,7 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio', onBa
             setError(err instanceof Error ? err.message : 'Failed to access microphone');
             setState('error');
         }
-    }, [serverUrl, state, startAudioAnalysis, language, targetLanguage, ttsEnabled, enqueueTtsAudio]);
+    }, [effectiveServerUrl, state, startAudioAnalysis, language, targetLanguage, ttsEnabled, enqueueTtsAudio]);
 
     const cleanup = useCallback(() => {
         stopAudioAnalysis();
