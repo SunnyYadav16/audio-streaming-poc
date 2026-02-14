@@ -2,11 +2,18 @@
 FastAPI WebSocket server for audio streaming with VAD.
 Receives audio chunks from browser, performs voice activity detection,
 and saves recordings as WAV files.
+
+Supports two modes:
+  - Solo mode (/ws/audio): single user, self-transcription & translation.
+  - Conversation mode (/ws/session): two users with bidirectional translation.
 """
 import os
 import io
+import json
 import wave
 import asyncio
+import string
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +30,7 @@ from services.vad import get_vad_service, SpeechSegmentDetector
 from services.asr_service import get_asr_service
 from services.mt_service import get_mt_service
 from services.tts_service import get_tts_service
+from services.turn_taking import TurnStateMachine
 
 app = FastAPI(title="Audio Streaming API")
 
@@ -259,8 +267,105 @@ class AudioSession:
             return None
 
 
-# Active sessions
+# Active sessions (solo mode)
 sessions: dict[str, AudioSession] = {}
+
+
+# ------------------------------------------------------------------ #
+#  Conversation Room (Phase 6 – Bidirectional Flow)                   #
+# ------------------------------------------------------------------ #
+
+class Participant:
+    """
+    Represents one user inside a ConversationRoom.
+
+    Wraps the WebSocket, display name, spoken language, and the
+    per-connection AudioSession used for VAD / decoding.
+    """
+
+    def __init__(
+        self,
+        ws: WebSocket,
+        name: str,
+        language: str,
+        session: AudioSession,
+        role: str = "a",
+    ):
+        self.ws = ws
+        self.name = name
+        self.language = language          # language this user speaks
+        self.session = session
+        self.role = role                  # 'a' (creator) or 'b' (joiner)
+        self.ws_open = True
+
+    async def send_json_safe(self, payload: dict):
+        """Send a JSON text frame, swallowing errors if the socket closed."""
+        if not self.ws_open:
+            return
+        try:
+            await self.ws.send_json(payload)
+        except Exception:
+            self.ws_open = False
+
+    async def send_bytes_safe(self, data: bytes):
+        """Send a binary frame, swallowing errors if the socket closed."""
+        if not self.ws_open:
+            return
+        try:
+            await self.ws.send_bytes(data)
+        except Exception:
+            self.ws_open = False
+
+
+class ConversationRoom:
+    """
+    A conversation session between two participants.
+
+    The room creator defines both languages up-front (e.g. English <-> Spanish).
+    The creator is assigned ``language_a``; whoever joins is automatically
+    assigned ``language_b``.  This keeps the join flow dead-simple for the
+    LEP user — they only need the room code and a name.
+    """
+
+    def __init__(self, room_id: str, language_a: str, language_b: str):
+        self.room_id = room_id
+        self.language_a = language_a   # creator's language
+        self.language_b = language_b   # joiner's language
+        self.participants: list[Participant] = []
+        self.created_at = datetime.now()
+        self.turn = TurnStateMachine()  # Phase 7: turn-taking & echo suppression
+
+    @property
+    def is_full(self) -> bool:
+        return len(self.participants) >= 2
+
+    def add_participant(self, participant: Participant):
+        self.participants.append(participant)
+
+    def remove_participant(self, participant: Participant):
+        if participant in self.participants:
+            self.participants.remove(participant)
+
+    def get_partner(self, participant: Participant) -> Optional[Participant]:
+        for p in self.participants:
+            if p is not participant:
+                return p
+        return None
+
+
+# Active conversation rooms
+conversation_rooms: dict[str, ConversationRoom] = {}
+
+# Characters for room codes (excluding ambiguous: O/0, I/1/L)
+_ROOM_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
+def _generate_room_id() -> str:
+    """Generate a short, human-friendly 6-character room code."""
+    while True:
+        code = "".join(random.choices(_ROOM_CHARS, k=6))
+        if code not in conversation_rooms:
+            return code
 
 
 @app.on_event("startup")
@@ -748,10 +853,410 @@ async def audio_websocket(websocket: WebSocket):
         sessions.pop(session_id, None)
 
 
+# ------------------------------------------------------------------ #
+#  Conversation session endpoint (Phase 6)                             #
+# ------------------------------------------------------------------ #
+
+@app.websocket("/ws/session")
+async def session_websocket(websocket: WebSocket):
+    """
+    Bidirectional conversation WebSocket.
+
+    Creating a room (no room_id)
+    ----------------------------
+    The creator defines the language pair for the whole session.
+
+    Query params:
+        name         – display name (default "User")
+        my_lang      – creator's spoken language (en | es | pt)
+        partner_lang – the other user's spoken language (en | es | pt)
+
+    Joining a room (room_id provided)
+    ---------------------------------
+    The joiner's language is auto-assigned from the room config.
+    No language selection needed — just code + name.
+
+    Query params:
+        room_id – 6-char room code
+        name    – display name (default "User")
+
+    Protocol (server → client)
+    --------------------------
+    JSON text frames:
+        room_created       – you created a new room (includes room_id, languages)
+        room_joined        – you joined an existing room (includes auto-assigned lang)
+        partner_joined     – the other user connected
+        partner_left       – the other user disconnected
+        transcript         – final ASR result (speaker: "self" | "partner")
+        transcript_partial – interim ASR result
+        error              – something went wrong
+
+    Binary frames:
+        WAV audio (TTS of partner's translated speech)
+    """
+    await websocket.accept()
+
+    VALID_LANGS = {"en", "es", "pt"}
+
+    # --- parse query params -----------------------------------------------
+    room_id_param = (websocket.query_params.get("room_id") or "").strip().upper()
+    user_name = websocket.query_params.get("name", "User").strip() or "User"
+
+    # --- create / join room -----------------------------------------------
+    if room_id_param:
+        # ---- JOINING an existing room ----
+        room = conversation_rooms.get(room_id_param)
+        if room is None:
+            await websocket.send_json(
+                {"type": "error", "message": f"Room {room_id_param} not found"}
+            )
+            await websocket.close()
+            return
+        if room.is_full:
+            await websocket.send_json(
+                {"type": "error", "message": f"Room {room_id_param} is full"}
+            )
+            await websocket.close()
+            return
+        room_id = room_id_param
+        # Auto-assign the remaining language
+        user_lang = room.language_b
+    else:
+        # ---- CREATING a new room ----
+        my_lang = (websocket.query_params.get("my_lang") or "en").strip().lower()
+        partner_lang = (websocket.query_params.get("partner_lang") or "es").strip().lower()
+        if my_lang not in VALID_LANGS:
+            my_lang = "en"
+        if partner_lang not in VALID_LANGS:
+            partner_lang = "es"
+
+        room_id = _generate_room_id()
+        room = ConversationRoom(room_id, language_a=my_lang, language_b=partner_lang)
+        conversation_rooms[room_id] = room
+        user_lang = my_lang
+
+    # --- set up participant -----------------------------------------------
+    session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    audio_session = AudioSession(session_id, language=user_lang)
+    role = "a" if len(room.participants) == 0 else "b"
+    participant = Participant(
+        websocket, user_name, user_lang, audio_session, role=role,
+    )
+    room.add_participant(participant)
+
+    # Notify the new participant
+    if len(room.participants) == 1:
+        await participant.send_json_safe({
+            "type": "room_created",
+            "room_id": room_id,
+            "user_name": user_name,
+            "language": user_lang,
+            "partner_language": room.language_b,
+        })
+        print(
+            f"[Room {room_id}] Created by {user_name} "
+            f"({room.language_a} ↔ {room.language_b})"
+        )
+    else:
+        partner = room.get_partner(participant)
+        # Tell the joiner about their auto-assigned language & partner
+        await participant.send_json_safe({
+            "type": "room_joined",
+            "room_id": room_id,
+            "user_name": user_name,
+            "language": user_lang,
+            "partner_name": partner.name if partner else None,
+            "partner_language": partner.language if partner else None,
+        })
+        # Tell the existing participant about the new joiner
+        if partner:
+            await partner.send_json_safe({
+                "type": "partner_joined",
+                "name": user_name,
+                "language": user_lang,
+            })
+        print(
+            f"[Room {room_id}] {user_name} joined as {user_lang} speaker – "
+            f"partner: {partner.name if partner else 'none'}"
+        )
+
+    # --- services ---------------------------------------------------------
+    asr_service = get_asr_service()
+    mt_service = get_mt_service()
+    tts_service = get_tts_service()
+    turn = room.turn  # shorthand for the state machine
+
+    background_tasks: list[asyncio.Task] = []
+    partial_task: Optional[asyncio.Task] = None
+    utterance_id = 0
+
+    def _wav_duration_ms(wav_bytes: bytes) -> float:
+        """Estimate duration of a WAV buffer in milliseconds."""
+        try:
+            buf = io.BytesIO(wav_bytes)
+            with wave.open(buf, "rb") as wf:
+                return (wf.getnframes() / wf.getframerate()) * 1000.0
+        except Exception:
+            return 2000.0  # safe fallback: assume 2 s
+
+    # ------------------------------------------------------------------
+    async def _process_speech(
+        pcm: np.ndarray,
+        msg_type: str,
+        utt_id: int,
+        duration: Optional[float] = None,
+    ):
+        """
+        Run ASR → MT → TTS pipeline and route results.
+
+        - The speaker's own transcript is sent back to them (speaker="self").
+        - The translated transcript + TTS audio is sent to the partner
+          (speaker="partner").
+        - After TTS is sent, the partner's mic is locked for TTS duration
+          + 200 ms (echo suppression via TurnStateMachine).
+        """
+        try:
+            text, used_lang = await asyncio.to_thread(
+                asr_service.transcribe, pcm, user_lang,
+            )
+            # Discard stale partials
+            if msg_type == "transcript_partial" and utt_id != utterance_id:
+                return
+            if not text:
+                return
+
+            source_lang = used_lang or user_lang
+
+            # ---- payload for SELF (the speaker) ----
+            self_payload: dict = {
+                "type": msg_type,
+                "speaker": "self",
+                "text": text,
+                "language": source_lang,
+            }
+            if duration is not None:
+                self_payload["duration"] = round(duration, 2)
+
+            # ---- find partner and build their payload ----
+            partner = room.get_partner(participant)
+            partner_payload: Optional[dict] = None
+            tts_wav: bytes = b""
+
+            if partner and partner.ws_open:
+                target_lang = partner.language
+
+                if source_lang != target_lang and source_lang != "unknown":
+                    translated = await asyncio.to_thread(
+                        mt_service.translate, text, source_lang, target_lang,
+                    )
+                    if translated:
+                        # Attach translation to self payload too
+                        self_payload["translation"] = translated
+                        self_payload["target_language"] = target_lang
+
+                        partner_payload = {
+                            "type": msg_type,
+                            "speaker": "partner",
+                            "speaker_name": user_name,
+                            "text": text,
+                            "language": source_lang,
+                            "translation": translated,
+                            "target_language": target_lang,
+                        }
+                        if duration is not None:
+                            partner_payload["duration"] = round(duration, 2)
+
+                        # TTS only for final transcripts
+                        if msg_type == "transcript":
+                            tts_wav = await asyncio.to_thread(
+                                tts_service.synthesize, translated, target_lang,
+                            )
+                            if tts_wav:
+                                partner_payload["has_tts"] = True
+                else:
+                    # Same language – relay untranslated
+                    partner_payload = {
+                        "type": msg_type,
+                        "speaker": "partner",
+                        "speaker_name": user_name,
+                        "text": text,
+                        "language": source_lang,
+                    }
+                    if duration is not None:
+                        partner_payload["duration"] = round(duration, 2)
+
+            # ---- send ----
+            await participant.send_json_safe(self_payload)
+
+            if partner and partner_payload:
+                await partner.send_json_safe(partner_payload)
+                if tts_wav:
+                    await partner.send_bytes_safe(tts_wav)
+
+                    # ── Echo suppression: lock partner's mic ──
+                    tts_dur = _wav_duration_ms(tts_wav)
+                    lockout_total = tts_dur + turn.lockout_buffer_ms
+                    turn.lock_user(partner.role, tts_dur)
+
+                    # Tell the partner their mic is muted (UX feedback)
+                    await partner.send_json_safe({
+                        "type": "mic_locked",
+                        "duration_ms": round(lockout_total),
+                        "reason": "tts_echo",
+                    })
+
+                    print(
+                        f"[Room {room_id}] Locked {partner.name}'s mic "
+                        f"for {lockout_total:.0f} ms "
+                        f"(TTS {tts_dur:.0f} ms + "
+                        f"{turn.lockout_buffer_ms:.0f} ms buffer)"
+                    )
+
+            # ---- log ----
+            if msg_type == "transcript":
+                log_msg = (
+                    f"[Room {room_id}] [{user_name}] "
+                    f"'{text}' ({source_lang})"
+                )
+                if partner_payload and "translation" in partner_payload:
+                    log_msg += (
+                        f" → '{partner_payload['translation']}' "
+                        f"({partner_payload['target_language']})"
+                    )
+                if tts_wav:
+                    log_msg += f" [TTS {len(tts_wav)} bytes]"
+                print(log_msg)
+
+        except Exception as e:
+            print(f"[Room {room_id}] [{user_name}] ASR/MT error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # --- main receive loop ------------------------------------------------
+    print(
+        f"[Room {room_id}] [{user_name}] Audio loop started "
+        f"(role={role})"
+    )
+
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            audio_session.add_chunk(data)
+
+            events = audio_session.process_for_vad(data)
+
+            for event in events:
+                if event["type"] == "speech_start":
+                    # ── Turn-taking gate ──
+                    allowed = turn.try_speech_start(role)
+                    if not allowed:
+                        # Floor held by partner or mic is echo-locked
+                        continue
+
+                    utterance_id += 1
+                    if partial_task and not partial_task.done():
+                        partial_task.cancel()
+                        partial_task = None
+
+                elif event["type"] == "speech_end":
+                    # ── Turn-taking gate ──
+                    was_active = turn.on_speech_end(role)
+                    if not was_active:
+                        # This user wasn't the recognised speaker; skip
+                        continue
+
+                    if partial_task and not partial_task.done():
+                        partial_task.cancel()
+                        partial_task = None
+
+                    utterance_pcm = event.get("utterance_pcm")
+                    dur = event.get("duration")
+                    if utterance_pcm is not None and utterance_pcm.size > 0:
+                        task = asyncio.create_task(
+                            _process_speech(
+                                utterance_pcm, "transcript", utterance_id, dur,
+                            )
+                        )
+                        background_tasks.append(task)
+
+            # Periodic partial transcript — only if we hold the floor
+            MIN_PARTIAL_SAMPLES = int(VAD_SAMPLE_RATE * 1.0)
+            if (
+                turn.holds_floor(role)
+                and audio_session.segment_detector.is_speaking
+                and audio_session.current_utterance_pcm.size >= MIN_PARTIAL_SAMPLES
+                and (partial_task is None or partial_task.done())
+            ):
+                partial_task = asyncio.create_task(
+                    _process_speech(
+                        audio_session.current_utterance_pcm.copy(),
+                        "transcript_partial",
+                        utterance_id,
+                    )
+                )
+                background_tasks.append(partial_task)
+
+    except WebSocketDisconnect:
+        print(f"[Room {room_id}] [{user_name}] Disconnected")
+    except Exception as e:
+        print(f"[Room {room_id}] [{user_name}] Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        participant.ws_open = False
+        for t in background_tasks:
+            if not t.done():
+                t.cancel()
+
+        # Notify partner of departure
+        partner = room.get_partner(participant)
+        if partner and partner.ws_open:
+            await partner.send_json_safe({
+                "type": "partner_left",
+                "name": user_name,
+            })
+
+        room.remove_participant(participant)
+        if not room.participants:
+            conversation_rooms.pop(room_id, None)
+            print(f"[Room {room_id}] Room closed (empty)")
+
+        # Save recording
+        if audio_session.chunks:
+            output_path = audio_session.save_as_wav()
+            if output_path:
+                print(f"[Room {room_id}] [{user_name}] Saved to {output_path}")
+
+
+# ------------------------------------------------------------------ #
+#  REST endpoints                                                      #
+# ------------------------------------------------------------------ #
+
 @app.get("/")
 async def root():
     """Health check endpoint."""
     return {"status": "ok", "message": "Audio Streaming API with VAD"}
+
+
+@app.get("/rooms")
+async def list_rooms():
+    """List active conversation rooms (for debugging / lobby)."""
+    return {
+        "rooms": [
+            {
+                "room_id": r.room_id,
+                "language_a": r.language_a,
+                "language_b": r.language_b,
+                "participants": [
+                    {"name": p.name, "language": p.language}
+                    for p in r.participants
+                ],
+                "is_full": r.is_full,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in conversation_rooms.values()
+        ]
+    }
 
 
 @app.get("/recordings")
