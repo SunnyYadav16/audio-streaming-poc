@@ -167,18 +167,35 @@ class TurnStateMachine:
         )
         return True
 
+    def release_floor(self, role: str):
+        """
+        Explicitly release the floor (e.g. when the user mutes their mic).
+
+        If *role* does not hold the floor, this is a no-op.
+        """
+        if self._floor_holder == role:
+            self._floor_holder = None
+            self._grace_expiry = 0.0
+            self.state = FloorState.IDLE
+
     def lock_user(self, role: str, duration_ms: float):
         """
         Lock a user's mic for echo suppression after TTS.
 
         Has **no effect** if *role* currently holds the floor (they are
         actively speaking and should not be interrupted).
+
+        If the user already has an active lock, the new lock is **extended**
+        to whichever expires later (max), ensuring queued TTS segments
+        don't cause premature unlock.
         """
         if self._floor_holder == role:
             return  # don't lock the active speaker
 
         total_ms = duration_ms + self.lockout_buffer_ms
-        self._lockout[role] = time.monotonic() + total_ms / 1000.0
+        new_expiry = time.monotonic() + total_ms / 1000.0
+        # Use max so queued TTS doesn't shorten an existing lock
+        self._lockout[role] = max(self._lockout.get(role, 0.0), new_expiry)
 
     # ------------------------------------------------------------------ #
     #  Diagnostics                                                         #
