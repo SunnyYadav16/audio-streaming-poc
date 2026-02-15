@@ -19,6 +19,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# Force line-buffered stdout so print() output appears immediately in
+# log files when running under nohup / systemd / Docker.
+sys.stdout.reconfigure(line_buffering=True)
+
 import av
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -56,11 +60,20 @@ class AudioStreamDecoder:
     """
     Incrementally decodes a WebM/Opus audio byte stream into PCM samples.
 
-    The browser sends small WebM/Opus chunks over the WebSocket. This class
-    buffers those bytes and uses PyAV to decode whatever complete frames are
-    available, returning 16 kHz mono float32 PCM suitable for VAD.
+    The browser sends small WebM/Opus chunks over the WebSocket.  This
+    class buffers those bytes and uses PyAV to decode whatever complete
+    frames are available, returning 16 kHz mono float32 PCM suitable for
+    VAD.
+
+    To prevent **O(N²) degradation** (re-decoding the entire session on
+    every chunk), the client periodically restarts its MediaRecorder,
+    which sends a new WebM EBML header.  When we detect that header we
+    reset the buffer so the decode window stays bounded.
     """
-    
+
+    # First 4 bytes of the EBML header that starts every WebM file.
+    _EBML_SIGNATURE = bytes([0x1A, 0x45, 0xDF, 0xA3])
+
     def __init__(self, target_sample_rate: int = 16000):
         self.target_sample_rate = target_sample_rate
         self.buffer = b''
@@ -68,23 +81,32 @@ class AudioStreamDecoder:
         # Track how many resampled samples have already been returned so
         # that each call only yields the *new* portion of the audio.
         self._samples_returned = 0
-    
+
     def add_chunk(self, data: bytes) -> np.ndarray:
         """
         Add a WebM/Opus chunk and return only the **newly decoded** PCM
         samples since the last successful call.
 
-        Because PyAV needs the full WebM byte stream to decode (header +
-        data), we re-open the entire buffer each time but slice off the
-        samples that were already returned in previous calls.
+        If *data* starts with a fresh EBML header (new MediaRecorder
+        segment), the accumulated buffer is reset so the decode window
+        stays small.
         """
+        # ── Detect fresh WebM header → reset decoder ──
+        if (
+            len(data) >= 4
+            and data[:4] == self._EBML_SIGNATURE
+            and self.initialized
+        ):
+            self.buffer = b''
+            self._samples_returned = 0
+
         self.buffer += data
-        
+
         try:
-            # Decode the full accumulated buffer
+            # Decode the accumulated buffer
             input_buffer = io.BytesIO(self.buffer)
             container = av.open(input_buffer, format='webm')
-            
+
             samples = []
             for stream in container.streams:
                 if stream.type == 'audio':
@@ -96,26 +118,26 @@ class AudioStreamDecoder:
                         else:
                             audio = audio[0]
                         samples.append(audio)
-            
+
             container.close()
-            
+
             if samples:
                 self.initialized = True
                 audio_data = np.concatenate(samples).astype(np.float32)
-                
+
                 # Resample from 48kHz to 16kHz if needed
                 if self.target_sample_rate != 48000:
                     audio_data = audio_data[::3]
-                
+
                 # Return only the new samples
                 new_samples = audio_data[self._samples_returned:]
                 self._samples_returned = len(audio_data)
                 return new_samples
-                
-        except Exception as e:
+
+        except Exception:
             # Not enough data yet to decode, or error
             pass
-        
+
         return np.array([], dtype=np.float32)
 
 
@@ -334,6 +356,7 @@ class ConversationRoom:
         self.participants: list[Participant] = []
         self.created_at = datetime.now()
         self.turn = TurnStateMachine()  # Phase 7: turn-taking & echo suppression
+        self.session_active = False     # U.4: controlled by creator's session_start
 
     @property
     def is_full(self) -> bool:
@@ -386,251 +409,6 @@ async def startup_event():
     print("[API] Loading TTS voices (Piper)...")
     get_tts_service()
     print("[API] TTS voices ready")
-
-
-# @app.websocket("/ws/audio")
-# async def audio_websocket(websocket: WebSocket):
-#     """WebSocket endpoint for receiving audio streams with VAD and ASR.
-
-#     VAD runs inline (fast). ASR runs in background threads so the receive
-#     loop is never blocked and audio flows continuously.
-#     """
-#     await websocket.accept()
-
-#     # Optional language selection from query params (en, es, pt or auto-detect)
-#     lang_param = websocket.query_params.get("lang")
-#     if lang_param not in {"en", "es", "pt"}:
-#         lang_param = None
-
-#     # Optional target language for machine translation
-#     target_lang_param = websocket.query_params.get("target_lang")
-#     if target_lang_param not in {"en", "es", "pt"}:
-#         target_lang_param = None
-
-#     # Optional TTS toggle (enabled by default when translation is active)
-#     tts_enabled = websocket.query_params.get("tts", "true").lower() != "false"
-
-#     session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-#     session = AudioSession(session_id, language=lang_param)
-#     sessions[session_id] = session
-#     asr_service = get_asr_service()
-#     mt_service = get_mt_service() if target_lang_param else None
-#     tts_service = get_tts_service() if (target_lang_param and tts_enabled) else None
-
-#     # Track background ASR tasks so we can clean up on disconnect
-#     background_tasks: list[asyncio.Task] = []
-#     # Track the current partial-ASR task (only one at a time)
-#     partial_task: Optional[asyncio.Task] = None
-#     # Monotonic counter to discard stale partial results
-#     utterance_id = 0
-#     ws_open = True
-
-#     async def _send_json_safe(payload: dict):
-#         """Send JSON to the browser, swallowing errors if the socket closed."""
-#         nonlocal ws_open
-#         if not ws_open:
-#             return
-#         try:
-#             await websocket.send_json(payload)
-#         except Exception:
-#             ws_open = False
-
-#     async def _send_bytes_safe(data: bytes):
-#         """Send binary data to the browser, swallowing errors if closed."""
-#         nonlocal ws_open
-#         if not ws_open:
-#             return
-#         try:
-#             await websocket.send_bytes(data)
-#         except Exception:
-#             ws_open = False
-
-#     async def _run_asr_and_send(
-#         pcm: np.ndarray,
-#         msg_type: str,
-#         utt_id: int,
-#         duration: Optional[float] = None,
-#     ):
-#         """Run Whisper in a worker thread, optionally translate, and send."""
-#         try:
-#             text, used_lang = await asyncio.to_thread(
-#                 asr_service.transcribe, pcm, lang_param,
-#             )
-#             # Discard stale partials (utterance already ended)
-#             if msg_type == "transcript_partial" and utt_id != utterance_id:
-#                 return
-#             if text:
-#                 source_lang = used_lang or lang_param or "unknown"
-#                 payload: dict = {
-#                     "type": msg_type,
-#                     "session_id": session_id,
-#                     "text": text,
-#                     "language": source_lang,
-#                 }
-#                 if duration is not None:
-#                     payload["duration"] = duration
-
-#                 # --- Machine Translation (if target language is set) ---
-#                 if (
-#                     mt_service is not None
-#                     and target_lang_param
-#                     and source_lang != target_lang_param
-#                     and source_lang != "unknown"
-#                 ):
-#                     translated = await asyncio.to_thread(
-#                         mt_service.translate,
-#                         text,
-#                         source_lang,
-#                         target_lang_param,
-#                     )
-#                     if translated:
-#                         payload["translation"] = translated
-#                         payload["target_language"] = target_lang_param
-
-#                 # --- TTS (only for final transcripts with a translation) ---
-#                 # tts_wav: bytes = b""
-#                 # if (
-#                 #     msg_type == "transcript"
-#                 #     and tts_service is not None
-#                 #     and target_lang_param
-#                 #     and payload.get("translation")
-#                 # ):
-#                 #     tts_wav = await asyncio.to_thread(
-#                 #         tts_service.synthesize,
-#                 #         payload["translation"],
-#                 #         target_lang_param,
-#                 #     )
-#                 #     if tts_wav:
-#                 #         payload["has_tts_audio"] = True
-#                 tts_wav: bytes = b""
-#                 if (
-#                     msg_type == "transcript"
-#                     and tts_service is not None
-#                     and target_lang_param
-#                     and payload.get("translation")
-#                 ):
-#                     tts_wav = await asyncio.to_thread(
-#                         tts_service.synthesize,
-#                         payload["translation"],
-#                         target_lang_param,
-#                     )
-#                     if tts_wav:
-#                         # Save TTS audio to disk for verification
-#                         tts_dir = Path(__file__).parent.parent / "recordings" / "tts"
-#                         tts_dir.mkdir(parents=True, exist_ok=True)
-#                         tts_path = tts_dir / f"{session_id}_utt{utt_id}_{target_lang_param}.wav"
-#                         tts_path.write_bytes(tts_wav)
-#                         payload["tts_saved"] = str(tts_path)
-
-#                 # if msg_type == "transcript":
-#                 #     log_msg = (
-#                 #         f"[{session_id}] Speech ended (duration: {duration}s) "
-#                 #         f"lang={source_lang} text='{text}'"
-#                 #     )
-#                 #     if "translation" in payload:
-#                 #         log_msg += f" -> [{target_lang_param}] '{payload['translation']}'"
-#                 #     if tts_wav:
-#                 #         log_msg += f" [TTS {len(tts_wav)} bytes]"
-#                 #     print(log_msg)
-#                 if msg_type == "transcript":
-#                     log_msg = (
-#                         f"[{session_id}] Speech ended (duration: {duration}s) "
-#                         f"lang={source_lang} text='{text}'"
-#                     )
-#                     if "translation" in payload:
-#                         log_msg += f" -> [{target_lang_param}] '{payload['translation']}'"
-#                     if tts_wav:
-#                         log_msg += f" [TTS saved: {payload['tts_saved']}]"
-#                     print(log_msg)
-
-#                 await _send_json_safe(payload)
-
-#                 # Send TTS WAV as a binary frame right after the JSON
-#                 if tts_wav:
-#                     await _send_bytes_safe(tts_wav)
-#         except Exception as e:
-#             print(f"[{session_id}] ASR/MT ({msg_type}) error: {e}")
-
-#     print(
-#         f"[{session_id}] Client connected "
-#         f"(language={lang_param or 'auto'}, target={target_lang_param or 'none'}, "
-#         f"tts={'on' if tts_service else 'off'})"
-#     )
-
-#     try:
-#         while True:
-#             data = await websocket.receive_bytes()
-#             session.add_chunk(data)
-
-#             # VAD processing — fast, never blocks
-#             events = session.process_for_vad(data)
-
-#             for event in events:
-#                 if event["type"] == "speech_start":
-#                     print(f"[{session_id}] 🎤 Speech started")
-#                     utterance_id += 1
-#                     # Cancel any in-flight partial for the previous utterance
-#                     if partial_task and not partial_task.done():
-#                         partial_task.cancel()
-#                         partial_task = None
-
-#                 elif event["type"] == "speech_end":
-#                     # Cancel any in-flight partial
-#                     if partial_task and not partial_task.done():
-#                         partial_task.cancel()
-#                         partial_task = None
-
-#                     utterance_pcm = event.get("utterance_pcm")
-#                     duration = event.get("duration")
-#                     if utterance_pcm is not None and utterance_pcm.size > 0:
-#                         task = asyncio.create_task(
-#                             _run_asr_and_send(
-#                                 utterance_pcm, "transcript", utterance_id, duration
-#                             )
-#                         )
-#                         background_tasks.append(task)
-
-#             # --- Periodic partial transcript while user is speaking ---
-#             # Fire a partial only when:
-#             #   - the user is actively speaking
-#             #   - we have at least ~1 second of utterance audio
-#             #   - no other partial is already in flight
-#             MIN_PARTIAL_SAMPLES = int(VAD_SAMPLE_RATE * 1.0)  # 1 second
-#             if (
-#                 session.segment_detector.is_speaking
-#                 and session.current_utterance_pcm.size >= MIN_PARTIAL_SAMPLES
-#                 and (partial_task is None or partial_task.done())
-#             ):
-#                 partial_task = asyncio.create_task(
-#                     _run_asr_and_send(
-#                         session.current_utterance_pcm.copy(),
-#                         "transcript_partial",
-#                         utterance_id,
-#                     )
-#                 )
-#                 background_tasks.append(partial_task)
-
-#     except WebSocketDisconnect:
-#         print(f"[{session_id}] Client disconnected")
-#     except Exception as e:
-#         print(f"[{session_id}] Error: {e}")
-#         import traceback
-#         traceback.print_exc()
-#     finally:
-#         ws_open = False
-#         # Cancel any in-flight ASR tasks
-#         for t in background_tasks:
-#             if not t.done():
-#                 t.cancel()
-#         # Save the full recording
-#         if session.chunks:
-#             output_path = session.save_as_wav()
-#             if output_path:
-#                 print(f"[{session_id}] Saved recording to {output_path}")
-#             else:
-#                 print(f"[{session_id}] Failed to save recording")
-
-#         sessions.pop(session_id, None)
 
 @app.websocket("/ws/audio")
 async def audio_websocket(websocket: WebSocket):
@@ -953,6 +731,11 @@ async def session_websocket(websocket: WebSocket):
             "language": user_lang,
             "partner_language": room.language_b,
         })
+        # U.5: session_status = waiting (only creator connected)
+        await participant.send_json_safe({
+            "type": "session_status",
+            "status": "waiting",
+        })
         print(
             f"[Room {room_id}] Created by {user_name} "
             f"({room.language_a} ↔ {room.language_b})"
@@ -975,6 +758,15 @@ async def session_websocket(websocket: WebSocket):
                 "name": user_name,
                 "language": user_lang,
             })
+
+        # U.5: session_status = ready (both connected, waiting for host)
+        for p in room.participants:
+            if p.ws_open:
+                await p.send_json_safe({
+                    "type": "session_status",
+                    "status": "ready",
+                })
+
         print(
             f"[Room {room_id}] {user_name} joined as {user_lang} speaker – "
             f"partner: {partner.name if partner else 'none'}"
@@ -1132,15 +924,118 @@ async def session_websocket(websocket: WebSocket):
             import traceback
             traceback.print_exc()
 
+    # ── Binary control markers (4-byte signals from client) ─────────────
+    SESSION_START_MARKER = b'STRT'   # U.3/U.4: creator starts session
+    SESSION_END_MARKER   = b'ENDS'   # U.6:     creator ends session
+    MIC_MUTE_MARKER      = b'MUTE'   # U.7:     user muted mic
+    MIC_UNMUTE_MARKER    = b'UNMT'   # U.7:     user unmuted mic
+
+    async def _handle_session_start():
+        """U.4: Creator starts the session — validate role A, broadcast."""
+        if role != "a":
+            print(f"[Room {room_id}] [{user_name}] ⚠ session_start rejected (role={role})")
+            return
+        if not room.is_full:
+            await participant.send_json_safe({
+                "type": "error",
+                "message": "Cannot start session — partner has not joined yet.",
+            })
+            return
+        room.session_active = True
+        # Broadcast session_status = active to both
+        for p in room.participants:
+            if p.ws_open:
+                await p.send_json_safe({
+                    "type": "session_status",
+                    "status": "active",
+                })
+        print(f"[Room {room_id}] ▶ Session started by {user_name}")
+
+    async def _handle_session_end():
+        """U.6: Creator ends the session — stop processing, notify both."""
+        if role != "a":
+            print(f"[Room {room_id}] [{user_name}] ⚠ session_end rejected (role={role})")
+            return
+        room.session_active = False
+        # Broadcast session_status = ready (back to room view)
+        for p in room.participants:
+            if p.ws_open:
+                await p.send_json_safe({
+                    "type": "session_status",
+                    "status": "ready",
+                })
+        print(f"[Room {room_id}] ⏹ Session ended by {user_name}")
+
+    async def _handle_mic_mute(muted: bool):
+        """U.7: Relay mute status to partner so they see a visual indicator."""
+        nonlocal utterance_id
+
+        if muted:
+            # If user was actively speaking, treat mute as implicit speech_end —
+            # process whatever audio was buffered so the utterance isn't lost.
+            if (
+                audio_session.segment_detector.is_speaking
+                and audio_session.current_utterance_pcm.size > 0
+            ):
+                utterance_pcm = audio_session.current_utterance_pcm.copy()
+                audio_session.current_utterance_pcm = np.array([], dtype=np.float32)
+
+                # Estimate duration from PCM length
+                dur = round(len(utterance_pcm) / VAD_SAMPLE_RATE, 2)
+
+                utterance_id += 1
+                task = asyncio.create_task(
+                    _process_speech(utterance_pcm, "transcript", utterance_id, dur)
+                )
+                background_tasks.append(task)
+
+            turn.release_floor(role)
+            # Reset VAD so no stale state carries over
+            audio_session.segment_detector.reset()
+            audio_session.vad_service.reset_states()
+        else:
+            # Reset on unmute for a clean start
+            audio_session.segment_detector.reset()
+            audio_session.vad_service.reset_states()
+            audio_session.current_utterance_pcm = np.array([], dtype=np.float32)
+
+        partner = room.get_partner(participant)
+        if partner and partner.ws_open:
+            await partner.send_json_safe({
+                "type": "partner_muted" if muted else "partner_unmuted",
+                "name": user_name,
+            })
+        print(f"[Room {room_id}] [{user_name}] {'🔇 Muted' if muted else '🔊 Unmuted'}")
+
     # --- main receive loop ------------------------------------------------
     print(
-        f"[Room {room_id}] [{user_name}] Audio loop started "
-        f"(role={role})"
+        f"[Room {room_id}] [{user_name}] Connected "
+        f"(role={role}, session_active={room.session_active})"
     )
 
     try:
         while True:
             data = await websocket.receive_bytes()
+
+            # ── Control signals: 4-byte binary markers ──
+            if len(data) == 4:
+                if data == SESSION_START_MARKER:
+                    await _handle_session_start()
+                    continue
+                elif data == SESSION_END_MARKER:
+                    await _handle_session_end()
+                    continue
+                elif data == MIC_MUTE_MARKER:
+                    await _handle_mic_mute(True)
+                    continue
+                elif data == MIC_UNMUTE_MARKER:
+                    await _handle_mic_mute(False)
+                    continue
+
+            # ── Skip audio processing if session is not active ──
+            if not room.session_active:
+                continue
+
             audio_session.add_chunk(data)
 
             events = audio_session.process_for_vad(data)
@@ -1151,6 +1046,10 @@ async def session_websocket(websocket: WebSocket):
                     allowed = turn.try_speech_start(role)
                     if not allowed:
                         # Floor held by partner or mic is echo-locked
+                        print(
+                            f"[Room {room_id}] [{user_name}] speech_start "
+                            f"REJECTED ({turn})"
+                        )
                         continue
 
                     utterance_id += 1
@@ -1163,6 +1062,10 @@ async def session_websocket(websocket: WebSocket):
                     was_active = turn.on_speech_end(role)
                     if not was_active:
                         # This user wasn't the recognised speaker; skip
+                        print(
+                            f"[Room {room_id}] [{user_name}] speech_end "
+                            f"IGNORED (not active speaker, {turn})"
+                        )
                         continue
 
                     if partial_task and not partial_task.done():
@@ -1182,7 +1085,8 @@ async def session_websocket(websocket: WebSocket):
             # Periodic partial transcript — only if we hold the floor
             MIN_PARTIAL_SAMPLES = int(VAD_SAMPLE_RATE * 1.0)
             if (
-                turn.holds_floor(role)
+                room.session_active
+                and turn.holds_floor(role)
                 and audio_session.segment_detector.is_speaking
                 and audio_session.current_utterance_pcm.size >= MIN_PARTIAL_SAMPLES
                 and (partial_task is None or partial_task.done())
@@ -1198,6 +1102,9 @@ async def session_websocket(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print(f"[Room {room_id}] [{user_name}] Disconnected")
+    except RuntimeError as e:
+        # Starlette raises RuntimeError after a disconnect message is received
+        print(f"[Room {room_id}] [{user_name}] Disconnected (ws closed)")
     except Exception as e:
         print(f"[Room {room_id}] [{user_name}] Error: {e}")
         import traceback
@@ -1208,12 +1115,21 @@ async def session_websocket(websocket: WebSocket):
             if not t.done():
                 t.cancel()
 
+        # If session was active and this user leaving kills it, end session
+        if room.session_active:
+            room.session_active = False
+
         # Notify partner of departure
         partner = room.get_partner(participant)
         if partner and partner.ws_open:
             await partner.send_json_safe({
                 "type": "partner_left",
                 "name": user_name,
+            })
+            # U.5: session_status = ended
+            await partner.send_json_safe({
+                "type": "session_status",
+                "status": "ended",
             })
 
         room.remove_participant(participant)
