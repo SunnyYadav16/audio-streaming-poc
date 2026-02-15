@@ -1,18 +1,19 @@
 /**
  * ConversationSession
  *
- * Phase 6: Bidirectional translated conversation between two users.
+ * Bidirectional translated conversation between two users.
  *
- * Flow:
- *   1. Room creator sets their name and picks the language pair
- *      (e.g. "English ↔ Spanish").  They are assigned language A.
- *   2. Joiner enters the room code + their name.  The system auto-assigns
- *      language B — no language picker needed for the LEP user.
- *   3. Both participants can speak; each hears the other's translated speech.
+ * Session lifecycle (U.2–U.6):
+ *   lobby   → create or join a room (no audio)
+ *   waiting → room created, waiting for partner (no audio)
+ *   ready   → both connected, host can start session (no audio)
+ *   active  → session live, audio flowing
+ *   ended   → partner disconnected
  *
- * Layout:
- *   LEFT  – Session controls (room code, language, mic, partner info).
- *   RIGHT – Chat-style transcript (self = right-aligned, partner = left).
+ * Mute (U.1/U.7):
+ *   During active session, either user can mute/unmute.
+ *   Muting stops sending audio chunks entirely.
+ *   Partner sees a visual indicator.
  */
 import { useState, useRef, useCallback, useEffect } from 'react';
 
@@ -22,8 +23,9 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 
 type SessionPhase =
     | 'lobby'       // choosing to create or join
-    | 'waiting'     // created room, waiting for partner
-    | 'active'      // both users connected
+    | 'waiting'     // created room, waiting for partner (no audio)
+    | 'ready'       // both users connected, host can start (no audio)
+    | 'active'      // session live, audio flowing
     | 'ended';      // partner left
 
 interface PartnerInfo {
@@ -42,6 +44,15 @@ interface ChatMessage {
     duration?: number;
     timestamp: Date;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Binary control markers (must match backend)                        */
+/* ------------------------------------------------------------------ */
+
+const MARKER_SESSION_START = new Uint8Array([0x53, 0x54, 0x52, 0x54]); // b'STRT'
+const MARKER_SESSION_END   = new Uint8Array([0x45, 0x4E, 0x44, 0x53]); // b'ENDS'
+const MARKER_MIC_MUTE      = new Uint8Array([0x4D, 0x55, 0x54, 0x45]); // b'MUTE'
+const MARKER_MIC_UNMUTE    = new Uint8Array([0x55, 0x4E, 0x4D, 0x54]); // b'UNMT'
 
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
@@ -71,6 +82,11 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
     const [livePartial, setLivePartial] = useState<{ speaker: 'self' | 'partner'; text: string; translation?: string } | null>(null);
     const [isPlayingTts, setIsPlayingTts] = useState(false);
 
+    /* ---- U.1–U.7 state ---- */
+    const [isCreator, setIsCreator] = useState(false);   // U.3: role A flag
+    const [isMuted, setIsMuted] = useState(false);        // U.1: local mute
+    const [partnerMuted, setPartnerMuted] = useState(false); // U.7: partner mute indicator
+
     /* ---- refs ---- */
     const wsRef = useRef<WebSocket | null>(null);
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -83,6 +99,11 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
     const ttsAudioCtxRef = useRef<AudioContext | null>(null);
     const ttsQueueRef = useRef<ArrayBuffer[]>([]);
     const ttsPlayingRef = useRef(false);
+    const isMutedRef = useRef(false);  // mirror for use in ondataavailable closure
+    const recorderRestartRef = useRef<number | null>(null); // periodic MediaRecorder restart
+
+    // Keep ref in sync with state
+    useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
 
     /* ---- TTS playback queue ---- */
     const playNextTts = useCallback(async () => {
@@ -130,7 +151,7 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
         return () => { disconnectAll(); };
     }, []);
 
-    /* ---- speaking indicator ---- */
+    /* ---- speaking indicator (energy-based VAD) ---- */
     const startAudioAnalysis = useCallback((stream: MediaStream) => {
         const audioContext = new AudioContext();
         const source = audioContext.createMediaStreamSource(stream);
@@ -168,23 +189,104 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
         setIsSpeaking(false);
     }, []);
 
-    /* ---- disconnect everything ---- */
-    const disconnectAll = useCallback(() => {
+    /* ---- U.2: start mic capture (called when session becomes active) ---- */
+    const startAudioCapture = useCallback(async () => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 },
+            });
+            streamRef.current = stream;
+            startAudioAnalysis(stream);
+
+            const recorder = new MediaRecorder(stream, {
+                mimeType: 'audio/webm;codecs=opus',
+                audioBitsPerSecond: 128000,
+            });
+            mediaRecorderRef.current = recorder;
+
+            recorder.ondataavailable = (e) => {
+                // U.1: skip send entirely when muted — no server processing
+                if (e.data.size > 0 && ws.readyState === WebSocket.OPEN && !isMutedRef.current) {
+                    ws.send(e.data);
+                }
+            };
+
+            recorder.start(250);
+            setIsRecording(true);
+            setIsMuted(false);
+            setDuration(0);
+            timerRef.current = window.setInterval(() => setDuration(d => d + 1), 1000);
+
+            // Restart MediaRecorder every 30s to send a fresh WebM header.
+            // This prevents the server's AudioStreamDecoder buffer from
+            // growing unbounded (O(N²) re-decode on every chunk).
+            const RESTART_INTERVAL_MS = 30_000;
+            recorderRestartRef.current = window.setInterval(() => {
+                const rec = mediaRecorderRef.current;
+                if (rec && rec.state === 'recording') {
+                    rec.stop();
+                    rec.start(250);
+                }
+            }, RESTART_INTERVAL_MS);
+        } catch (micErr) {
+            setError(micErr instanceof Error ? micErr.message : 'Microphone access denied');
+        }
+    }, [startAudioAnalysis]);
+
+    /* ---- U.2/U.6: stop mic capture (session ended / paused) ---- */
+    const stopAudioCapture = useCallback(() => {
         stopAudioAnalysis();
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+        if (recorderRestartRef.current) { clearInterval(recorderRestartRef.current); recorderRestartRef.current = null; }
         if (mediaRecorderRef.current?.state !== 'inactive') mediaRecorderRef.current?.stop();
         mediaRecorderRef.current = null;
         streamRef.current?.getTracks().forEach(t => t.stop());
         streamRef.current = null;
-        wsRef.current?.close();
-        wsRef.current = null;
         ttsQueueRef.current = [];
         ttsPlayingRef.current = false;
         setIsPlayingTts(false);
         setIsRecording(false);
+        setIsSpeaking(false);
+        setIsMuted(false);
+        setMicLocked(false);
     }, [stopAudioAnalysis]);
 
-    /* ---- connect WebSocket & mic ---- */
+    /* ---- disconnect everything ---- */
+    const disconnectAll = useCallback(() => {
+        stopAudioCapture();
+        wsRef.current?.close();
+        wsRef.current = null;
+    }, [stopAudioCapture]);
+
+    /* ---- U.3: Start Session (creator only) ---- */
+    const startSession = useCallback(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(MARKER_SESSION_START);
+        }
+    }, []);
+
+    /* ---- U.6: End Session (creator only) ---- */
+    const endSession = useCallback(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(MARKER_SESSION_END);
+        }
+    }, []);
+
+    /* ---- U.1/U.7: Toggle mute ---- */
+    const toggleMute = useCallback(() => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        const willMute = !isMutedRef.current;
+        setIsMuted(willMute);
+        // Send MUTE/UNMT to server so partner gets visual indicator
+        ws.send(willMute ? MARKER_MIC_MUTE : MARKER_MIC_UNMUTE);
+    }, []);
+
+    /* ---- connect WebSocket (NO mic — U.2) ---- */
     const connectToRoom = useCallback(async (opts: {
         roomId?: string;
         name: string;
@@ -194,49 +296,30 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
         try {
             setError(null);
 
-            // Build URL
+            // Build URL with protocol-aware WebSocket
             const params = new URLSearchParams();
             if (opts.roomId) {
                 // JOINING – no language params; server auto-assigns
                 params.set('room_id', opts.roomId);
+                setIsCreator(false);
             } else {
                 // CREATING – send both languages
                 params.set('my_lang', opts.myLang || 'en');
                 params.set('partner_lang', opts.partnerLang || 'es');
+                setIsCreator(true);
             }
             params.set('name', opts.name || 'User');
-            const wsUrl = `ws://localhost:8000/ws/session?${params.toString()}`;
+
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${wsProtocol}//${window.location.host}/ws/session?${params.toString()}`;
 
             const ws = new WebSocket(wsUrl);
             wsRef.current = ws;
             ws.binaryType = 'arraybuffer';
 
-            ws.onopen = async () => {
-                // Start mic capture
-                try {
-                    const stream = await navigator.mediaDevices.getUserMedia({
-                        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 },
-                    });
-                    streamRef.current = stream;
-                    startAudioAnalysis(stream);
-
-                    const recorder = new MediaRecorder(stream, {
-                        mimeType: 'audio/webm;codecs=opus',
-                        audioBitsPerSecond: 128000,
-                    });
-                    mediaRecorderRef.current = recorder;
-                    recorder.ondataavailable = (e) => {
-                        if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-                            ws.send(e.data);
-                        }
-                    };
-                    recorder.start(250);
-                    setIsRecording(true);
-                    setDuration(0);
-                    timerRef.current = window.setInterval(() => setDuration(d => d + 1), 1000);
-                } catch (micErr) {
-                    setError(micErr instanceof Error ? micErr.message : 'Microphone access denied');
-                }
+            // U.2: on open we do NOT request mic — just confirm connection
+            ws.onopen = () => {
+                console.log('[WS] Connected to room');
             };
 
             ws.onerror = () => {
@@ -246,7 +329,8 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
             };
 
             ws.onclose = () => {
-                disconnectAll();
+                stopAudioCapture();
+                wsRef.current = null;
             };
 
             ws.onmessage = (event) => {
@@ -264,27 +348,59 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                         case 'room_created':
                             setRoomCode(msg.room_id);
                             setMyLanguage(msg.language);
-                            setPhase('waiting');
+                            // Phase set by session_status
                             break;
 
                         case 'room_joined':
                             setRoomCode(msg.room_id);
-                            // Server auto-assigned our language
                             setMyLanguage(msg.language);
                             if (msg.partner_name) {
                                 setPartner({ name: msg.partner_name, language: msg.partner_language });
                             }
-                            setPhase('active');
+                            // Phase set by session_status
                             break;
 
                         case 'partner_joined':
                             setPartner({ name: msg.name, language: msg.language });
-                            setPhase('active');
+                            setPartnerMuted(false);
+                            // Phase set by session_status
                             break;
 
                         case 'partner_left':
                             setPartner(null);
-                            setPhase('ended');
+                            setPartnerMuted(false);
+                            // Phase set by session_status
+                            break;
+
+                        // U.5: Session status — drives phase transitions
+                        case 'session_status':
+                            switch (msg.status) {
+                                case 'waiting':
+                                    setPhase('waiting');
+                                    break;
+                                case 'ready':
+                                    // Stop audio if we were active (End Session)
+                                    stopAudioCapture();
+                                    setPhase('ready');
+                                    break;
+                                case 'active':
+                                    setPhase('active');
+                                    // Start mic capture now
+                                    startAudioCapture();
+                                    break;
+                                case 'ended':
+                                    stopAudioCapture();
+                                    setPhase('ended');
+                                    break;
+                            }
+                            break;
+
+                        // U.7: Partner mute indicators
+                        case 'partner_muted':
+                            setPartnerMuted(true);
+                            break;
+                        case 'partner_unmuted':
+                            setPartnerMuted(false);
                             break;
 
                         case 'transcript':
@@ -325,6 +441,7 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
 
                         case 'error':
                             setError(msg.message || 'Unknown error');
+                            disconnectAll();
                             setPhase('lobby');
                             break;
                     }
@@ -334,13 +451,14 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
             setError(err instanceof Error ? err.message : 'Connection failed');
             setPhase('lobby');
         }
-    }, [startAudioAnalysis, disconnectAll, enqueueTtsAudio]);
+    }, [startAudioCapture, stopAudioCapture, disconnectAll, enqueueTtsAudio]);
 
     const handleCreate = useCallback(() => {
         if (langA === langB) { setError('Languages must be different'); return; }
         setMessages([]);
         setPartner(null);
         setLivePartial(null);
+        setPartnerMuted(false);
         connectToRoom({ name: myName, myLang: langA, partnerLang: langB });
     }, [connectToRoom, myName, langA, langB]);
 
@@ -350,6 +468,7 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
         setMessages([]);
         setPartner(null);
         setLivePartial(null);
+        setPartnerMuted(false);
         connectToRoom({ roomId: code, name: joinName });
     }, [joinCode, joinName, connectToRoom]);
 
@@ -363,6 +482,9 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
         setDuration(0);
         setMyLanguage('en');
         setMicLocked(false);
+        setIsMuted(false);
+        setPartnerMuted(false);
+        setIsCreator(false);
     }, [disconnectAll]);
 
     const formatDuration = (s: number) =>
@@ -453,12 +575,21 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                     background: #22d3ee;
                     box-shadow: 0 0 8px rgba(34,211,238,0.5);
                 }
+                .cs-partner-dot.muted {
+                    background: #f59e0b;
+                    box-shadow: 0 0 8px rgba(245,158,11,0.5);
+                }
                 .cs-partner-name {
                     font-size: 14px; font-weight: 600; color: #e4e4e7;
                 }
                 .cs-partner-lang {
                     font-size: 12px; color: #22d3ee;
                     font-family: 'JetBrains Mono', monospace;
+                }
+                .cs-partner-muted-label {
+                    font-size: 10px; color: #f59e0b;
+                    font-family: 'JetBrains Mono', monospace;
+                    letter-spacing: 1px;
                 }
 
                 /* status ring */
@@ -480,6 +611,10 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                     border-color: rgba(34,211,238,0.4);
                     box-shadow: 0 0 30px rgba(34,211,238,0.1);
                 }
+                .cs-ring.muted-ring {
+                    border-color: rgba(239,68,68,0.4);
+                    box-shadow: 0 0 30px rgba(239,68,68,0.1);
+                }
                 @keyframes cs-pulse {
                     0%, 100% { transform: scale(1); opacity: 1; }
                     50% { transform: scale(1.05); opacity: 0.7; }
@@ -495,6 +630,7 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                 .cs-status.speaking { color: #6366f1; }
                 .cs-status.recording { color: #22d3ee; }
                 .cs-status.locked { color: #f59e0b; }
+                .cs-status.muted-status { color: #ef4444; }
 
                 .cs-ring.locked {
                     border-color: rgba(245,158,11,0.5);
@@ -579,6 +715,27 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                 }
                 .cs-btn.danger:hover { background: rgba(239,68,68,0.2); }
                 .cs-btn.small { width: auto; max-width: none; padding: 10px 18px; font-size: 13px; }
+                .cs-btn.success {
+                    background: rgba(34,197,94,0.15); color: #22c55e;
+                    border: 1px solid rgba(34,197,94,0.3);
+                    box-shadow: 0 4px 20px rgba(34,197,94,0.15);
+                }
+                .cs-btn.success:hover { background: rgba(34,197,94,0.25); }
+                .cs-btn.warning {
+                    background: rgba(245,158,11,0.12); color: #f59e0b;
+                    border: 1px solid rgba(245,158,11,0.25);
+                }
+                .cs-btn.warning:hover { background: rgba(245,158,11,0.2); }
+                .cs-btn.mute-btn {
+                    background: rgba(239,68,68,0.12); color: #ef4444;
+                    border: 1px solid rgba(239,68,68,0.25);
+                    max-width: 280px;
+                }
+                .cs-btn.mute-btn:hover { background: rgba(239,68,68,0.2); }
+                .cs-btn.mute-btn.active {
+                    background: rgba(239,68,68,0.25); color: #fca5a5;
+                    border-color: rgba(239,68,68,0.5);
+                }
 
                 .cs-error {
                     background: rgba(239,68,68,0.1);
@@ -620,6 +777,22 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                 @keyframes cs-bar {
                     0%, 100% { transform: scaleY(0.5); }
                     50% { transform: scaleY(1.2); }
+                }
+
+                /* ready-stage info box */
+                .cs-ready-info {
+                    background: rgba(34,197,94,0.08);
+                    border: 1px solid rgba(34,197,94,0.2);
+                    border-radius: 10px; padding: 14px 20px;
+                    text-align: center; max-width: 280px;
+                }
+                .cs-ready-info .label {
+                    font-family: 'JetBrains Mono', monospace;
+                    font-size: 10px; color: #22c55e; letter-spacing: 2px;
+                    text-transform: uppercase; margin-bottom: 6px;
+                }
+                .cs-ready-info .text {
+                    font-size: 13px; color: #a1a1aa; line-height: 1.5;
                 }
 
                 /* ---- right panel: chat ---- */
@@ -760,11 +933,11 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
             <div className="cs-root">
                 {/* ==================== LEFT: Sidebar ==================== */}
                 <div className="cs-sidebar">
-                    <button className="cs-back" onClick={onBack}>
+                    <button className="cs-back" onClick={phase === 'lobby' ? onBack : handleLeave}>
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                             <path d="M19 12H5" /><path d="M12 19l-7-7 7-7" />
                         </svg>
-                        Back
+                        {phase === 'lobby' ? 'Back' : 'Leave Room'}
                     </button>
 
                     <div className="cs-logo">Conversation</div>
@@ -848,7 +1021,7 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                         </>
                     )}
 
-                    {/* ---- WAITING ---- */}
+                    {/* ---- WAITING (room created, no partner yet) ---- */}
                     {phase === 'waiting' && (
                         <>
                             <div className="cs-room-code-box">
@@ -880,8 +1053,74 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                         </>
                     )}
 
-                    {/* ---- ACTIVE ---- */}
-                    {(phase === 'active' || phase === 'ended') && (
+                    {/* ---- READY (both connected, no session yet — U.2) ---- */}
+                    {phase === 'ready' && (
+                        <>
+                            <div className="cs-room-code-box">
+                                <div className="cs-room-code-label">Room Code</div>
+                                <div className="cs-room-code">{roomCode}</div>
+                            </div>
+
+                            {/* Your role */}
+                            <div style={{
+                                background: 'rgba(99,102,241,0.08)',
+                                border: '1px solid rgba(99,102,241,0.2)',
+                                borderRadius: 8, padding: '8px 16px',
+                                fontSize: 13, color: '#a5b4fc',
+                                fontFamily: "'JetBrains Mono', monospace",
+                                textAlign: 'center' as const,
+                            }}>
+                                You speak <strong style={{ color: '#818cf8' }}>{langLabel[myLanguage] ?? myLanguage}</strong>
+                            </div>
+
+                            {/* Partner badge */}
+                            {partner && (
+                                <div className="cs-partner-badge">
+                                    <div className="cs-partner-dot" />
+                                    <div>
+                                        <div className="cs-partner-name">{partner.name}</div>
+                                        <div className="cs-partner-lang">
+                                            speaks {langLabel[partner.language] ?? partner.language}
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* U.3: Start Session button — creator only */}
+                            {isCreator ? (
+                                <>
+                                    <div className="cs-ready-info">
+                                        <div className="label">Both users connected</div>
+                                        <div className="text">
+                                            Start the session when you're ready to begin translation.
+                                        </div>
+                                    </div>
+                                    <button className="cs-btn success" onClick={startSession}>
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                            <path d="M8 5v14l11-7z"/>
+                                        </svg>
+                                        Start Session
+                                    </button>
+                                </>
+                            ) : (
+                                <>
+                                    <div className="cs-waiting-dots">
+                                        <span /><span /><span />
+                                    </div>
+                                    <div style={{ fontSize: 13, color: '#71717a', textAlign: 'center' }}>
+                                        Waiting for host to start session...
+                                    </div>
+                                </>
+                            )}
+
+                            <button className="cs-btn danger" onClick={handleLeave}>
+                                Leave Room
+                            </button>
+                        </>
+                    )}
+
+                    {/* ---- ACTIVE (session live) ---- */}
+                    {phase === 'active' && (
                         <>
                             {/* Room code + language pair */}
                             <div style={{
@@ -904,27 +1143,27 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                 You speak <strong style={{ color: '#818cf8' }}>{langLabel[myLanguage] ?? myLanguage}</strong>
                             </div>
 
-                            {/* Partner badge */}
-                            {partner ? (
+                            {/* Partner badge (U.7: shows muted state) */}
+                            {partner && (
                                 <div className="cs-partner-badge">
-                                    <div className="cs-partner-dot" />
+                                    <div className={`cs-partner-dot ${partnerMuted ? 'muted' : ''}`} />
                                     <div>
                                         <div className="cs-partner-name">{partner.name}</div>
                                         <div className="cs-partner-lang">
                                             speaks {langLabel[partner.language] ?? partner.language}
                                         </div>
+                                        {partnerMuted && (
+                                            <div className="cs-partner-muted-label">MUTED</div>
+                                        )}
                                     </div>
                                 </div>
-                            ) : phase === 'ended' ? (
-                                <div style={{ fontSize: 13, color: '#ef4444' }}>
-                                    Partner disconnected
-                                </div>
-                            ) : null}
+                            )}
 
                             {/* Status ring */}
                             <div className="cs-ring-wrap">
                                 <div className={`cs-ring ${
-                                    micLocked ? 'locked'
+                                    isMuted ? 'muted-ring'
+                                    : micLocked ? 'locked'
                                     : isSpeaking ? 'speaking'
                                     : isRecording ? 'recording' : ''
                                 }`} />
@@ -933,12 +1172,14 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                 </div>
                             </div>
                             <div className={`cs-status ${
-                                micLocked ? 'locked'
+                                isMuted ? 'muted-status'
+                                : micLocked ? 'locked'
                                 : isSpeaking ? 'speaking'
                                 : isRecording ? 'recording' : ''
                             }`}>
-                                {micLocked
-                                    ? 'Mic paused — listening'
+                                {isMuted
+                                    ? 'Muted'
+                                    : micLocked ? 'Mic paused — listening'
                                     : isSpeaking ? 'Speaking...'
                                     : isRecording ? 'Listening' : 'Inactive'}
                             </div>
@@ -954,6 +1195,64 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                     {micLocked ? 'Listening to translation...' : 'Partner speaking...'}
                                 </div>
                             )}
+
+                            {/* U.1/U.7: Mute button — available during active session */}
+                            <button
+                                className={`cs-btn mute-btn ${isMuted ? 'active' : ''}`}
+                                onClick={toggleMute}
+                            >
+                                {isMuted ? (
+                                    <>
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                            <line x1="1" y1="1" x2="23" y2="23"/>
+                                            <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/>
+                                            <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2c0 .76-.13 1.49-.35 2.17"/>
+                                            <line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+                                        </svg>
+                                        Unmute Mic
+                                    </>
+                                ) : (
+                                    <>
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                                            <line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+                                        </svg>
+                                        Mute Mic
+                                    </>
+                                )}
+                            </button>
+
+                            {/* U.6: End Session — creator only */}
+                            {isCreator && (
+                                <button className="cs-btn warning" onClick={endSession}>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                                        <rect x="6" y="6" width="12" height="12" rx="1"/>
+                                    </svg>
+                                    End Session
+                                </button>
+                            )}
+
+                            <button className="cs-btn danger" onClick={handleLeave}>
+                                Leave Room
+                            </button>
+                        </>
+                    )}
+
+                    {/* ---- ENDED (partner disconnected) ---- */}
+                    {phase === 'ended' && (
+                        <>
+                            <div style={{
+                                fontFamily: "'JetBrains Mono', monospace",
+                                fontSize: 11, color: '#52525b', letterSpacing: 2,
+                                textAlign: 'center' as const,
+                            }}>
+                                ROOM {roomCode}
+                            </div>
+
+                            <div style={{ fontSize: 13, color: '#ef4444', textAlign: 'center' }}>
+                                Partner disconnected
+                            </div>
 
                             <button className="cs-btn danger" onClick={handleLeave}>
                                 Leave Room
@@ -977,13 +1276,21 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                         {messages.length === 0 && !livePartial ? (
                             <div className="cs-empty">
                                 <div className="cs-empty-icon">
-                                    {phase === 'lobby' ? '🔗' : phase === 'waiting' ? '⏳' : '💬'}
+                                    {phase === 'lobby' ? '🔗'
+                                        : phase === 'waiting' ? '⏳'
+                                        : phase === 'ready' ? '✋'
+                                        : phase === 'ended' ? '👋'
+                                        : '💬'}
                                 </div>
                                 <div className="cs-empty-text">
                                     {phase === 'lobby'
                                         ? 'Create or join a room to start a translated conversation.'
                                         : phase === 'waiting'
                                         ? 'Waiting for your partner to join. Share the room code!'
+                                        : phase === 'ready'
+                                        ? isCreator
+                                            ? 'Your partner has joined. Click "Start Session" to begin.'
+                                            : 'Connected! Waiting for the host to start the session.'
                                         : phase === 'ended'
                                         ? 'The conversation has ended.'
                                         : 'Start speaking — your conversation will appear here in real time.'}
