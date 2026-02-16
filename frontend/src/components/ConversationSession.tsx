@@ -37,6 +37,7 @@ interface ChatMessage {
     id: number;
     speaker: 'self' | 'partner';
     speakerName?: string;
+    speakerRole?: 'creator' | 'participant';
     text: string;
     language: string;
     translation?: string;
@@ -50,9 +51,9 @@ interface ChatMessage {
 /* ------------------------------------------------------------------ */
 
 const MARKER_SESSION_START = new Uint8Array([0x53, 0x54, 0x52, 0x54]); // b'STRT'
-const MARKER_SESSION_END   = new Uint8Array([0x45, 0x4E, 0x44, 0x53]); // b'ENDS'
-const MARKER_MIC_MUTE      = new Uint8Array([0x4D, 0x55, 0x54, 0x45]); // b'MUTE'
-const MARKER_MIC_UNMUTE    = new Uint8Array([0x55, 0x4E, 0x4D, 0x54]); // b'UNMT'
+const MARKER_SESSION_END = new Uint8Array([0x45, 0x4E, 0x44, 0x53]); // b'ENDS'
+const MARKER_MIC_MUTE = new Uint8Array([0x4D, 0x55, 0x54, 0x45]); // b'MUTE'
+const MARKER_MIC_UNMUTE = new Uint8Array([0x55, 0x4E, 0x4D, 0x54]); // b'UNMT'
 
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
@@ -77,10 +78,10 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
     const [isRecording, setIsRecording] = useState(false);
     const [isSpeaking, setIsSpeaking] = useState(false);
     const [duration, setDuration] = useState(0);
-    const [micLocked, setMicLocked] = useState(false);  // echo-suppression lockout
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [livePartial, setLivePartial] = useState<{ speaker: 'self' | 'partner'; text: string; translation?: string } | null>(null);
     const [isPlayingTts, setIsPlayingTts] = useState(false);
+    const [judgeIsSpeaking, setJudgeIsSpeaking] = useState(false);  // A.8: creator override banner
 
     /* ---- U.1–U.7 state ---- */
     const [isCreator, setIsCreator] = useState(false);   // U.3: role A flag
@@ -97,47 +98,74 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
     const chatEndRef = useRef<HTMLDivElement | null>(null);
     const msgIdRef = useRef(0);
     const ttsAudioCtxRef = useRef<AudioContext | null>(null);
-    const ttsQueueRef = useRef<ArrayBuffer[]>([]);
+    const ttsQueueRef = useRef<{ buf: ArrayBuffer; priority: 'high' | 'normal' }[]>([]);
     const ttsPlayingRef = useRef(false);
+    const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null);  // A.6: for interrupt
+    const ttsCooldownRef = useRef(false);  // A.3: client-side echo cooldown flag
+    const nextTtsPriorityRef = useRef<'high' | 'normal'>('normal');  // priority of next TTS binary
     const isMutedRef = useRef(false);  // mirror for use in ondataavailable closure
     const recorderRestartRef = useRef<number | null>(null); // periodic MediaRecorder restart
 
     // Keep ref in sync with state
     useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
 
-    /* ---- TTS playback queue ---- */
+    /* ---- TTS playback queue (A.6: priority-aware) ---- */
     const playNextTts = useCallback(async () => {
         if (ttsPlayingRef.current) return;
-        const buf = ttsQueueRef.current.shift();
-        if (!buf) { setIsPlayingTts(false); return; }
+        const item = ttsQueueRef.current.shift();
+        if (!item) { setIsPlayingTts(false); setJudgeIsSpeaking(false); return; }
 
         ttsPlayingRef.current = true;
         setIsPlayingTts(true);
+        if (item.priority === 'high') setJudgeIsSpeaking(true);
 
         try {
             if (!ttsAudioCtxRef.current) ttsAudioCtxRef.current = new AudioContext();
             const ctx = ttsAudioCtxRef.current;
             if (ctx.state === 'suspended') await ctx.resume();
 
-            const decoded = await ctx.decodeAudioData(buf.slice(0));
+            const decoded = await ctx.decodeAudioData(item.buf.slice(0));
             const source = ctx.createBufferSource();
             source.buffer = decoded;
             source.connect(ctx.destination);
+            ttsSourceRef.current = source;
             source.onended = () => {
+                ttsSourceRef.current = null;
                 ttsPlayingRef.current = false;
+                setJudgeIsSpeaking(false);
+
+                // A.3: client-side echo cooldown — suppress audio sending
+                // for 300ms after TTS playback ends to prevent mic pickup.
+                ttsCooldownRef.current = true;
+                setTimeout(() => { ttsCooldownRef.current = false; }, 300);
+
                 playNextTts();
             };
             source.start();
         } catch (e) {
             console.error('TTS playback error:', e);
+            ttsSourceRef.current = null;
             ttsPlayingRef.current = false;
             setIsPlayingTts(false);
+            setJudgeIsSpeaking(false);
             playNextTts();
         }
     }, []);
 
+    /** A.6: interrupt current TTS and clear normal-priority queue */
+    const interruptTts = useCallback(() => {
+        // Stop current playback
+        try { ttsSourceRef.current?.stop(); } catch { /* already stopped */ }
+        ttsSourceRef.current = null;
+        ttsPlayingRef.current = false;
+        // Clear only normal-priority items from queue
+        ttsQueueRef.current = ttsQueueRef.current.filter(i => i.priority === 'high');
+    }, []);
+
     const enqueueTtsAudio = useCallback((data: ArrayBuffer) => {
-        ttsQueueRef.current.push(data);
+        const priority = nextTtsPriorityRef.current;
+        nextTtsPriorityRef.current = 'normal'; // reset for next binary
+        ttsQueueRef.current.push({ buf: data, priority });
         playNextTts();
     }, [playNextTts]);
 
@@ -208,8 +236,8 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
             mediaRecorderRef.current = recorder;
 
             recorder.ondataavailable = (e) => {
-                // U.1: skip send entirely when muted — no server processing
-                if (e.data.size > 0 && ws.readyState === WebSocket.OPEN && !isMutedRef.current) {
+                // U.1: skip send when muted; A.3: also skip during echo cooldown
+                if (e.data.size > 0 && ws.readyState === WebSocket.OPEN && !isMutedRef.current && !ttsCooldownRef.current) {
                     ws.send(e.data);
                 }
             };
@@ -247,11 +275,13 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
         streamRef.current = null;
         ttsQueueRef.current = [];
         ttsPlayingRef.current = false;
+        try { ttsSourceRef.current?.stop(); } catch { /* already stopped */ }
+        ttsSourceRef.current = null;
         setIsPlayingTts(false);
+        setJudgeIsSpeaking(false);
         setIsRecording(false);
         setIsSpeaking(false);
         setIsMuted(false);
-        setMicLocked(false);
     }, [stopAudioAnalysis]);
 
     /* ---- disconnect everything ---- */
@@ -405,12 +435,17 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
 
                         case 'transcript':
                             if (typeof msg.text === 'string') {
+                                // Set priority for next binary TTS frame
+                                if (msg.tts_priority) {
+                                    nextTtsPriorityRef.current = msg.tts_priority;
+                                }
                                 setLivePartial(null);
                                 msgIdRef.current += 1;
                                 setMessages(prev => [...prev, {
                                     id: msgIdRef.current,
                                     speaker: msg.speaker || 'self',
                                     speakerName: msg.speaker_name,
+                                    speakerRole: msg.speaker_role,
                                     text: msg.text,
                                     language: msg.language ?? 'unknown',
                                     translation: msg.translation,
@@ -431,13 +466,15 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                             }
                             break;
 
-                        case 'mic_locked': {
-                            // Server locked our mic (echo suppression after TTS)
-                            setMicLocked(true);
-                            const lockDuration = msg.duration_ms || 2000;
-                            setTimeout(() => setMicLocked(false), lockDuration);
+                        case 'mic_locked':
+                            // Legacy: ignore (echo suppression now client-side)
                             break;
-                        }
+
+                        // A.6: priority interrupt from creator
+                        case 'tts_interrupt':
+                            interruptTts();
+                            nextTtsPriorityRef.current = 'high';
+                            break;
 
                         case 'error':
                             setError(msg.message || 'Unknown error');
@@ -451,7 +488,7 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
             setError(err instanceof Error ? err.message : 'Connection failed');
             setPhase('lobby');
         }
-    }, [startAudioCapture, stopAudioCapture, disconnectAll, enqueueTtsAudio]);
+    }, [startAudioCapture, stopAudioCapture, disconnectAll, enqueueTtsAudio, interruptTts]);
 
     const handleCreate = useCallback(() => {
         if (langA === langB) { setError('Languages must be different'); return; }
@@ -481,10 +518,10 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
         setLivePartial(null);
         setDuration(0);
         setMyLanguage('en');
-        setMicLocked(false);
         setIsMuted(false);
         setPartnerMuted(false);
         setIsCreator(false);
+        setJudgeIsSpeaking(false);
     }, [disconnectAll]);
 
     const formatDuration = (s: number) =>
@@ -629,18 +666,24 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                 }
                 .cs-status.speaking { color: #6366f1; }
                 .cs-status.recording { color: #22d3ee; }
-                .cs-status.locked { color: #f59e0b; }
                 .cs-status.muted-status { color: #ef4444; }
 
-                .cs-ring.locked {
-                    border-color: rgba(245,158,11,0.5);
-                    box-shadow: 0 0 30px rgba(245,158,11,0.1);
-                    animation: cs-pulse-lock 2s ease-in-out infinite;
+
+                /* Judge speaking banner */
+                .cs-judge-banner {
+                    display: flex; align-items: center; gap: 8px;
+                    background: rgba(245,158,11,0.12);
+                    border: 1px solid rgba(245,158,11,0.3);
+                    border-radius: 10px; padding: 10px 16px;
+                    font-family: 'JetBrains Mono', monospace;
+                    font-size: 11px; color: #f59e0b; letter-spacing: 1px;
+                    animation: cs-judge-pulse 1.5s ease-in-out infinite;
                 }
-                @keyframes cs-pulse-lock {
-                    0%, 100% { opacity: 1; }
-                    50% { opacity: 0.5; }
+                @keyframes cs-judge-pulse {
+                    0%, 100% { opacity: 1; border-color: rgba(245,158,11,0.3); }
+                    50% { opacity: 0.7; border-color: rgba(245,158,11,0.6); }
                 }
+
 
                 /* lobby inputs */
                 .cs-field {
@@ -1097,7 +1140,7 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                     </div>
                                     <button className="cs-btn success" onClick={startSession}>
                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                                            <path d="M8 5v14l11-7z"/>
+                                            <path d="M8 5v14l11-7z" />
                                         </svg>
                                         Start Session
                                     </button>
@@ -1161,38 +1204,45 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
 
                             {/* Status ring */}
                             <div className="cs-ring-wrap">
-                                <div className={`cs-ring ${
-                                    isMuted ? 'muted-ring'
-                                    : micLocked ? 'locked'
-                                    : isSpeaking ? 'speaking'
-                                    : isRecording ? 'recording' : ''
-                                }`} />
+                                <div className={`cs-ring ${isMuted ? 'muted-ring'
+                                        : isSpeaking ? 'speaking'
+                                            : isRecording ? 'recording' : ''
+                                    }`} />
                                 <div className="cs-timer">
                                     {isRecording ? formatDuration(duration) : '--:--'}
                                 </div>
                             </div>
-                            <div className={`cs-status ${
-                                isMuted ? 'muted-status'
-                                : micLocked ? 'locked'
-                                : isSpeaking ? 'speaking'
-                                : isRecording ? 'recording' : ''
-                            }`}>
+                            <div className={`cs-status ${isMuted ? 'muted-status'
+                                    : isSpeaking ? 'speaking'
+                                        : isRecording ? 'recording' : ''
+                                }`}>
                                 {isMuted
                                     ? 'Muted'
-                                    : micLocked ? 'Mic paused — listening'
                                     : isSpeaking ? 'Speaking...'
-                                    : isRecording ? 'Listening' : 'Inactive'}
+                                        : isRecording ? 'Listening' : 'Inactive'}
                             </div>
 
-                            {/* TTS / locked indicator */}
-                            {(isPlayingTts || micLocked) && (
+                            {/* A.8: Judge/Creator speaking override banner */}
+                            {judgeIsSpeaking && (
+                                <div className="cs-judge-banner">
+                                    <div className="cs-tts-bars">
+                                        <div className="cs-tts-bar" />
+                                        <div className="cs-tts-bar" />
+                                        <div className="cs-tts-bar" />
+                                    </div>
+                                    Court officer is speaking…
+                                </div>
+                            )}
+
+                            {/* TTS indicator (normal priority) */}
+                            {isPlayingTts && !judgeIsSpeaking && (
                                 <div className="cs-tts-playing">
                                     <div className="cs-tts-bars">
                                         <div className="cs-tts-bar" />
                                         <div className="cs-tts-bar" />
                                         <div className="cs-tts-bar" />
                                     </div>
-                                    {micLocked ? 'Listening to translation...' : 'Partner speaking...'}
+                                    Partner speaking...
                                 </div>
                             )}
 
@@ -1204,19 +1254,19 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                 {isMuted ? (
                                     <>
                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                            <line x1="1" y1="1" x2="23" y2="23"/>
-                                            <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/>
-                                            <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2c0 .76-.13 1.49-.35 2.17"/>
-                                            <line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+                                            <line x1="1" y1="1" x2="23" y2="23" />
+                                            <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
+                                            <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2c0 .76-.13 1.49-.35 2.17" />
+                                            <line x1="12" y1="19" x2="12" y2="23" /><line x1="8" y1="23" x2="16" y2="23" />
                                         </svg>
                                         Unmute Mic
                                     </>
                                 ) : (
                                     <>
                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                                            <line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+                                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                                            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                                            <line x1="12" y1="19" x2="12" y2="23" /><line x1="8" y1="23" x2="16" y2="23" />
                                         </svg>
                                         Mute Mic
                                     </>
@@ -1227,7 +1277,7 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                             {isCreator && (
                                 <button className="cs-btn warning" onClick={endSession}>
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                                        <rect x="6" y="6" width="12" height="12" rx="1"/>
+                                        <rect x="6" y="6" width="12" height="12" rx="1" />
                                     </svg>
                                     End Session
                                 </button>
@@ -1278,22 +1328,22 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                 <div className="cs-empty-icon">
                                     {phase === 'lobby' ? '🔗'
                                         : phase === 'waiting' ? '⏳'
-                                        : phase === 'ready' ? '✋'
-                                        : phase === 'ended' ? '👋'
-                                        : '💬'}
+                                            : phase === 'ready' ? '✋'
+                                                : phase === 'ended' ? '👋'
+                                                    : '💬'}
                                 </div>
                                 <div className="cs-empty-text">
                                     {phase === 'lobby'
                                         ? 'Create or join a room to start a translated conversation.'
                                         : phase === 'waiting'
-                                        ? 'Waiting for your partner to join. Share the room code!'
-                                        : phase === 'ready'
-                                        ? isCreator
-                                            ? 'Your partner has joined. Click "Start Session" to begin.'
-                                            : 'Connected! Waiting for the host to start the session.'
-                                        : phase === 'ended'
-                                        ? 'The conversation has ended.'
-                                        : 'Start speaking — your conversation will appear here in real time.'}
+                                            ? 'Waiting for your partner to join. Share the room code!'
+                                            : phase === 'ready'
+                                                ? isCreator
+                                                    ? 'Your partner has joined. Click "Start Session" to begin.'
+                                                    : 'Connected! Waiting for the host to start the session.'
+                                                : phase === 'ended'
+                                                    ? 'The conversation has ended.'
+                                                    : 'Start speaking — your conversation will appear here in real time.'}
                                 </div>
                             </div>
                         ) : (

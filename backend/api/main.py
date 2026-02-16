@@ -34,7 +34,7 @@ from services.vad import get_vad_service, SpeechSegmentDetector
 from services.asr_service import get_asr_service
 from services.mt_service import get_mt_service
 from services.tts_service import get_tts_service
-from services.turn_taking import TurnStateMachine
+from services.priority_router import PriorityRouter
 from services.session_recorder import (
     SessionRecorder,
     TranscriptLogger,
@@ -347,13 +347,14 @@ class Participant:
 
 class ConversationRoom:
     """
-    A conversation session between two participants.
+    A conversation session between multiple participants.
 
     The room creator defines both languages up-front (e.g. English <-> Spanish).
-    The creator is assigned ``language_a``; whoever joins is automatically
-    assigned ``language_b``.  This keeps the join flow dead-simple for the
-    LEP user — they only need the room code and a name.
+    The creator is assigned ``language_a``; joiners are automatically
+    assigned ``language_b``.  Supports up to ``max_participants`` users.
     """
+
+    MAX_PARTICIPANTS = 6
 
     def __init__(self, room_id: str, language_a: str, language_b: str):
         self.room_id = room_id
@@ -361,7 +362,7 @@ class ConversationRoom:
         self.language_b = language_b   # joiner's language
         self.participants: list[Participant] = []
         self.created_at = datetime.now()
-        self.turn = TurnStateMachine()  # Phase 7: turn-taking & echo suppression
+        self.priority = PriorityRouter()  # Phase 11: priority routing
         # Phase 10: session recording & transcript
         self.recorder: Optional[SessionRecorder] = None
         self.transcript_logger: Optional[TranscriptLogger] = None
@@ -371,7 +372,7 @@ class ConversationRoom:
 
     @property
     def is_full(self) -> bool:
-        return len(self.participants) >= 2
+        return len(self.participants) >= self.MAX_PARTICIPANTS
 
     def add_participant(self, participant: Participant):
         self.participants.append(participant)
@@ -381,10 +382,15 @@ class ConversationRoom:
             self.participants.remove(participant)
 
     def get_partner(self, participant: Participant) -> Optional[Participant]:
+        """Legacy helper — returns first other participant."""
         for p in self.participants:
             if p is not participant:
                 return p
         return None
+
+    def get_others(self, participant: Participant) -> list["Participant"]:
+        """Return all participants except the given one."""
+        return [p for p in self.participants if p is not participant]
 
 
 # Active conversation rooms
@@ -703,12 +709,12 @@ async def session_websocket(websocket: WebSocket):
             return
         if room.is_full:
             await websocket.send_json(
-                {"type": "error", "message": f"Room {room_id_param} is full"}
+                {"type": "error", "message": f"Room {room_id_param} is full (max {room.MAX_PARTICIPANTS})"}
             )
             await websocket.close()
             return
         room_id = room_id_param
-        # Auto-assign the remaining language
+        # Auto-assign the joiner language
         user_lang = room.language_b
     else:
         # ---- CREATING a new room ----
@@ -727,7 +733,9 @@ async def session_websocket(websocket: WebSocket):
     # --- set up participant -----------------------------------------------
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     audio_session = AudioSession(session_id, language=user_lang)
-    role = "a" if len(room.participants) == 0 else "b"
+    # Assign roles: a (creator), b, c, d, …
+    _ROLES = "abcdefghij"
+    role = _ROLES[len(room.participants)] if len(room.participants) < len(_ROLES) else f"p{len(room.participants)}"
     participant = Participant(
         websocket, user_name, user_lang, audio_session, role=role,
     )
@@ -752,46 +760,51 @@ async def session_websocket(websocket: WebSocket):
             f"({room.language_a} ↔ {room.language_b})"
         )
     else:
-        partner = room.get_partner(participant)
-        # Tell the joiner about their auto-assigned language & partner
+        others = room.get_others(participant)
+        # Tell the joiner about their auto-assigned language & existing partners
+        first_other = others[0] if others else None
         await participant.send_json_safe({
             "type": "room_joined",
             "room_id": room_id,
             "user_name": user_name,
             "language": user_lang,
-            "partner_name": partner.name if partner else None,
-            "partner_language": partner.language if partner else None,
+            "partner_name": first_other.name if first_other else None,
+            "partner_language": first_other.language if first_other else None,
         })
-        # Tell the existing participant about the new joiner
-        if partner:
-            await partner.send_json_safe({
-                "type": "partner_joined",
-                "name": user_name,
-                "language": user_lang,
-            })
-
-        # U.5: session_status = ready (both connected, waiting for host)
-        for p in room.participants:
-            if p.ws_open:
-                await p.send_json_safe({
-                    "type": "session_status",
-                    "status": "ready",
+        # Tell all existing participants about the new joiner
+        for other in others:
+            if other.ws_open:
+                await other.send_json_safe({
+                    "type": "partner_joined",
+                    "name": user_name,
+                    "language": user_lang,
                 })
+
+        # U.5: session_status = ready (2+ connected, waiting for host)
+        if len(room.participants) >= 2:
+            for p in room.participants:
+                if p.ws_open:
+                    await p.send_json_safe({
+                        "type": "session_status",
+                        "status": "ready",
+                    })
 
         print(
             f"[Room {room_id}] {user_name} joined as {user_lang} speaker – "
-            f"partner: {partner.name if partner else 'none'}"
+            f"{len(others)} other(s) in room"
         )
 
     # --- services ---------------------------------------------------------
     asr_service = get_asr_service()
     mt_service = get_mt_service()
     tts_service = get_tts_service()
-    turn = room.turn  # shorthand for the state machine
 
     background_tasks: list[asyncio.Task] = []
     partial_task: Optional[asyncio.Task] = None
     utterance_id = 0
+
+    # Phase 11 (A.2): serialise ASR calls to avoid thread-safety issues
+    _asr_lock = asyncio.Lock()
 
     def _wav_duration_ms(wav_bytes: bytes) -> float:
         """Estimate duration of a WAV buffer in milliseconds."""
@@ -810,18 +823,19 @@ async def session_websocket(websocket: WebSocket):
         duration: Optional[float] = None,
     ):
         """
-        Run ASR → MT → TTS pipeline and route results.
+        Run ASR → MT → TTS pipeline and route results to ALL other
+        participants.  No turn-taking gating — concurrent speech is allowed.
 
-        - The speaker's own transcript is sent back to them (speaker="self").
-        - The translated transcript + TTS audio is sent to the partner
-          (speaker="partner").
-        - After TTS is sent, the partner's mic is locked for TTS duration
-          + 200 ms (echo suppression via TurnStateMachine).
+        Priority:
+          - Creator (role a) → tts_priority "high"  (interrupts others' TTS)
+          - Everyone else    → tts_priority "normal"
         """
         try:
-            text, used_lang = await asyncio.to_thread(
-                asr_service.transcribe, pcm, user_lang,
-            )
+            # A.2: serialise ASR to avoid CTranslate2 thread-safety issues
+            async with _asr_lock:
+                text, used_lang = await asyncio.to_thread(
+                    asr_service.transcribe, pcm, user_lang,
+                )
             # Discard stale partials
             if msg_type == "transcript_partial" and utt_id != utterance_id:
                 return
@@ -829,91 +843,97 @@ async def session_websocket(websocket: WebSocket):
                 return
 
             source_lang = used_lang or user_lang
+            tts_priority = room.priority.get_priority(role)
+            speaker_role = room.priority.get_speaker_role(role)
 
             # ---- payload for SELF (the speaker) ----
             self_payload: dict = {
                 "type": msg_type,
                 "speaker": "self",
+                "speaker_role": speaker_role,
                 "text": text,
                 "language": source_lang,
             }
             if duration is not None:
                 self_payload["duration"] = round(duration, 2)
 
-            # ---- find partner and build their payload ----
-            partner = room.get_partner(participant)
-            partner_payload: Optional[dict] = None
-            tts_wav: bytes = b""
+            # ---- build payloads for each OTHER participant ----
+            others = room.get_others(participant)
+            first_translated: Optional[str] = None
+            first_target_lang: Optional[str] = None
+            tts_cache: dict[str, bytes] = {}  # lang -> wav bytes
 
-            if partner and partner.ws_open:
-                target_lang = partner.language
+            for other in others:
+                if not other.ws_open:
+                    continue
+
+                target_lang = other.language
+                other_payload: Optional[dict] = None
+                tts_wav: bytes = b""
 
                 if source_lang != target_lang and source_lang != "unknown":
                     translated = await asyncio.to_thread(
                         mt_service.translate, text, source_lang, target_lang,
                     )
                     if translated:
-                        # Attach translation to self payload too
-                        self_payload["translation"] = translated
-                        self_payload["target_language"] = target_lang
+                        # Attach translation to self payload (first time)
+                        if first_translated is None:
+                            first_translated = translated
+                            first_target_lang = target_lang
+                            self_payload["translation"] = translated
+                            self_payload["target_language"] = target_lang
 
-                        partner_payload = {
+                        other_payload = {
                             "type": msg_type,
                             "speaker": "partner",
                             "speaker_name": user_name,
+                            "speaker_role": speaker_role,
                             "text": text,
                             "language": source_lang,
                             "translation": translated,
                             "target_language": target_lang,
+                            "tts_priority": tts_priority,
                         }
                         if duration is not None:
-                            partner_payload["duration"] = round(duration, 2)
+                            other_payload["duration"] = round(duration, 2)
 
-                        # TTS only for final transcripts
+                        # TTS only for final transcripts (cache per language)
                         if msg_type == "transcript":
-                            tts_wav = await asyncio.to_thread(
-                                tts_service.synthesize, translated, target_lang,
-                            )
+                            if target_lang in tts_cache:
+                                tts_wav = tts_cache[target_lang]
+                            else:
+                                tts_wav = await asyncio.to_thread(
+                                    tts_service.synthesize, translated, target_lang,
+                                )
+                                tts_cache[target_lang] = tts_wav
                             if tts_wav:
-                                partner_payload["has_tts"] = True
+                                other_payload["has_tts"] = True
                 else:
                     # Same language – relay untranslated
-                    partner_payload = {
+                    other_payload = {
                         "type": msg_type,
                         "speaker": "partner",
                         "speaker_name": user_name,
+                        "speaker_role": speaker_role,
                         "text": text,
                         "language": source_lang,
+                        "tts_priority": tts_priority,
                     }
                     if duration is not None:
-                        partner_payload["duration"] = round(duration, 2)
+                        other_payload["duration"] = round(duration, 2)
 
-            # ---- send ----
+                # ---- send to this recipient ----
+                if other_payload:
+                    # A.5: high-priority → send tts_interrupt before audio
+                    if tts_wav and tts_priority == "high":
+                        await other.send_json_safe({"type": "tts_interrupt"})
+
+                    await other.send_json_safe(other_payload)
+                    if tts_wav:
+                        await other.send_bytes_safe(tts_wav)
+
+            # ---- send to SELF ----
             await participant.send_json_safe(self_payload)
-
-            if partner and partner_payload:
-                await partner.send_json_safe(partner_payload)
-                if tts_wav:
-                    await partner.send_bytes_safe(tts_wav)
-
-                    # ── Echo suppression: lock partner's mic ──
-                    tts_dur = _wav_duration_ms(tts_wav)
-                    lockout_total = tts_dur + turn.lockout_buffer_ms
-                    turn.lock_user(partner.role, tts_dur)
-
-                    # Tell the partner their mic is muted (UX feedback)
-                    await partner.send_json_safe({
-                        "type": "mic_locked",
-                        "duration_ms": round(lockout_total),
-                        "reason": "tts_echo",
-                    })
-
-                    print(
-                        f"[Room {room_id}] Locked {partner.name}'s mic "
-                        f"for {lockout_total:.0f} ms "
-                        f"(TTS {tts_dur:.0f} ms + "
-                        f"{turn.lockout_buffer_ms:.0f} ms buffer)"
-                    )
 
             # ---- Phase 10: record audio & log transcript ----
             if msg_type == "transcript" and room.recorder is not None:
@@ -921,25 +941,18 @@ async def session_websocket(websocket: WebSocket):
                 room.recorder.add_speech_pcm(role, pcm, 16_000)
 
                 # Record TTS audio into target language track
-                if tts_wav:
-                    target_lang = partner.language if partner else None
-                    if target_lang:
-                        room.recorder.add_tts_pcm(target_lang, tts_wav)
+                for lang, wav_data in tts_cache.items():
+                    if wav_data:
+                        room.recorder.add_tts_pcm(lang, wav_data)
 
                 # Log transcript entry
                 if room.transcript_logger is not None:
-                    translation_text = (
-                        partner_payload.get("translation") if partner_payload else None
-                    )
-                    target_lang_text = (
-                        partner_payload.get("target_language") if partner_payload else None
-                    )
                     room.transcript_logger.add_entry(
                         role=role,
                         text=text,
                         language=source_lang,
-                        translation=translation_text,
-                        target_language=target_lang_text,
+                        translation=first_translated,
+                        target_language=first_target_lang,
                         duration=duration,
                     )
 
@@ -949,13 +962,14 @@ async def session_websocket(websocket: WebSocket):
                     f"[Room {room_id}] [{user_name}] "
                     f"'{text}' ({source_lang})"
                 )
-                if partner_payload and "translation" in partner_payload:
+                if first_translated:
                     log_msg += (
-                        f" → '{partner_payload['translation']}' "
-                        f"({partner_payload['target_language']})"
+                        f" → '{first_translated}' "
+                        f"({first_target_lang})"
                     )
-                if tts_wav:
-                    log_msg += f" [TTS {len(tts_wav)} bytes]"
+                tts_total = sum(len(w) for w in tts_cache.values() if w)
+                if tts_total:
+                    log_msg += f" [TTS {tts_total} bytes → {len(others)} recipient(s)]"
                 print(log_msg)
 
         except Exception as e:
@@ -1044,7 +1058,7 @@ async def session_websocket(websocket: WebSocket):
         print(f"[Room {room_id}] ⏹ Session ended by {user_name}")
 
     async def _handle_mic_mute(muted: bool):
-        """U.7: Relay mute status to partner so they see a visual indicator."""
+        """U.7: Relay mute status to all other participants."""
         nonlocal utterance_id
 
         if muted:
@@ -1066,7 +1080,7 @@ async def session_websocket(websocket: WebSocket):
                 )
                 background_tasks.append(task)
 
-            turn.release_floor(role)
+            # A.9: no floor release needed — there's no floor concept anymore
             # Reset VAD so no stale state carries over
             audio_session.segment_detector.reset()
             audio_session.vad_service.reset_states()
@@ -1076,12 +1090,13 @@ async def session_websocket(websocket: WebSocket):
             audio_session.vad_service.reset_states()
             audio_session.current_utterance_pcm = np.array([], dtype=np.float32)
 
-        partner = room.get_partner(participant)
-        if partner and partner.ws_open:
-            await partner.send_json_safe({
-                "type": "partner_muted" if muted else "partner_unmuted",
-                "name": user_name,
-            })
+        # Notify all other participants
+        for other in room.get_others(participant):
+            if other.ws_open:
+                await other.send_json_safe({
+                    "type": "partner_muted" if muted else "partner_unmuted",
+                    "name": user_name,
+                })
         print(f"[Room {room_id}] [{user_name}] {'🔇 Muted' if muted else '🔊 Unmuted'}")
 
     async def _finalize_session_recording():
@@ -1192,32 +1207,13 @@ async def session_websocket(websocket: WebSocket):
 
             for event in events:
                 if event["type"] == "speech_start":
-                    # ── Turn-taking gate ──
-                    allowed = turn.try_speech_start(role)
-                    if not allowed:
-                        # Floor held by partner or mic is echo-locked
-                        print(
-                            f"[Room {room_id}] [{user_name}] speech_start "
-                            f"REJECTED ({turn})"
-                        )
-                        continue
-
+                    # Phase 11: no turn-taking gate — always accept
                     utterance_id += 1
                     if partial_task and not partial_task.done():
                         partial_task.cancel()
                         partial_task = None
 
                 elif event["type"] == "speech_end":
-                    # ── Turn-taking gate ──
-                    was_active = turn.on_speech_end(role)
-                    if not was_active:
-                        # This user wasn't the recognised speaker; skip
-                        print(
-                            f"[Room {room_id}] [{user_name}] speech_end "
-                            f"IGNORED (not active speaker, {turn})"
-                        )
-                        continue
-
                     if partial_task and not partial_task.done():
                         partial_task.cancel()
                         partial_task = None
@@ -1232,11 +1228,10 @@ async def session_websocket(websocket: WebSocket):
                         )
                         background_tasks.append(task)
 
-            # Periodic partial transcript — only if we hold the floor
+            # Periodic partial transcript — no floor check, always allowed
             MIN_PARTIAL_SAMPLES = int(VAD_SAMPLE_RATE * 1.0)
             if (
                 room.session_active
-                and turn.holds_floor(role)
                 and audio_session.segment_detector.is_speaking
                 and audio_session.current_utterance_pcm.size >= MIN_PARTIAL_SAMPLES
                 and (partial_task is None or partial_task.done())
@@ -1271,18 +1266,19 @@ async def session_websocket(websocket: WebSocket):
             # Phase 10: finalise recording on disconnect
             await _finalize_session_recording()
 
-        # Notify partner of departure
-        partner = room.get_partner(participant)
-        if partner and partner.ws_open:
-            await partner.send_json_safe({
-                "type": "partner_left",
-                "name": user_name,
-            })
-            # U.5: session_status = ended
-            await partner.send_json_safe({
-                "type": "session_status",
-                "status": "ended",
-            })
+        # Notify all remaining participants of departure
+        for other in room.get_others(participant):
+            if other.ws_open:
+                await other.send_json_safe({
+                    "type": "partner_left",
+                    "name": user_name,
+                })
+                # If only 1 left after this departure, signal ended
+                if len(room.participants) <= 2:
+                    await other.send_json_safe({
+                        "type": "session_status",
+                        "status": "ended",
+                    })
 
         room.remove_participant(participant)
         if not room.participants:
