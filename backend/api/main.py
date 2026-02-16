@@ -35,6 +35,12 @@ from services.asr_service import get_asr_service
 from services.mt_service import get_mt_service
 from services.tts_service import get_tts_service
 from services.turn_taking import TurnStateMachine
+from services.session_recorder import (
+    SessionRecorder,
+    TranscriptLogger,
+    write_manifest,
+    SESSIONS_DIR,
+)
 
 app = FastAPI(title="Audio Streaming API")
 
@@ -356,6 +362,11 @@ class ConversationRoom:
         self.participants: list[Participant] = []
         self.created_at = datetime.now()
         self.turn = TurnStateMachine()  # Phase 7: turn-taking & echo suppression
+        # Phase 10: session recording & transcript
+        self.recorder: Optional[SessionRecorder] = None
+        self.transcript_logger: Optional[TranscriptLogger] = None
+        self.session_start_time: Optional[datetime] = None
+        self.session_name: Optional[str] = None
         self.session_active = False     # U.4: controlled by creator's session_start
 
     @property
@@ -904,6 +915,34 @@ async def session_websocket(websocket: WebSocket):
                         f"{turn.lockout_buffer_ms:.0f} ms buffer)"
                     )
 
+            # ---- Phase 10: record audio & log transcript ----
+            if msg_type == "transcript" and room.recorder is not None:
+                # Record original speaker PCM
+                room.recorder.add_speech_pcm(role, pcm, 16_000)
+
+                # Record TTS audio into target language track
+                if tts_wav:
+                    target_lang = partner.language if partner else None
+                    if target_lang:
+                        room.recorder.add_tts_pcm(target_lang, tts_wav)
+
+                # Log transcript entry
+                if room.transcript_logger is not None:
+                    translation_text = (
+                        partner_payload.get("translation") if partner_payload else None
+                    )
+                    target_lang_text = (
+                        partner_payload.get("target_language") if partner_payload else None
+                    )
+                    room.transcript_logger.add_entry(
+                        role=role,
+                        text=text,
+                        language=source_lang,
+                        translation=translation_text,
+                        target_language=target_lang_text,
+                        duration=duration,
+                    )
+
             # ---- log ----
             if msg_type == "transcript":
                 log_msg = (
@@ -942,6 +981,40 @@ async def session_websocket(websocket: WebSocket):
             })
             return
         room.session_active = True
+        room.session_start_time = datetime.now()
+
+        # Phase 10: build session name and initialise recorder + logger
+        ts = room.session_start_time.strftime("%Y%m%d_%H%M%S")
+        room.session_name = f"{ts}_{room_id}_{room.language_a}-{room.language_b}"
+
+        # Resolve participant names
+        name_a = "User A"
+        name_b = "User B"
+        for p in room.participants:
+            if p.role == "a":
+                name_a = p.name
+            elif p.role == "b":
+                name_b = p.name
+
+        room.recorder = SessionRecorder(
+            session_name=room.session_name,
+            language_a=room.language_a,
+            language_b=room.language_b,
+            name_a=name_a,
+            name_b=name_b,
+        )
+        room.transcript_logger = TranscriptLogger(
+            session_name=room.session_name,
+            language_a=room.language_a,
+            language_b=room.language_b,
+            name_a=name_a,
+            name_b=name_b,
+        )
+        print(
+            f"[Room {room_id}] 📼 Session recorder initialised: "
+            f"{room.session_name}"
+        )
+
         # Broadcast session_status = active to both
         for p in room.participants:
             if p.ws_open:
@@ -957,6 +1030,10 @@ async def session_websocket(websocket: WebSocket):
             print(f"[Room {room_id}] [{user_name}] ⚠ session_end rejected (role={role})")
             return
         room.session_active = False
+
+        # Phase 10: finalise session recording & transcript
+        await _finalize_session_recording()
+
         # Broadcast session_status = ready (back to room view)
         for p in room.participants:
             if p.ws_open:
@@ -1006,6 +1083,79 @@ async def session_websocket(websocket: WebSocket):
                 "name": user_name,
             })
         print(f"[Room {room_id}] [{user_name}] {'🔇 Muted' if muted else '🔊 Unmuted'}")
+
+    async def _finalize_session_recording():
+        """Phase 10: write WAVs, transcript, and manifest to disk."""
+        if room.recorder is None or room.session_name is None:
+            return
+
+        session_dir = SESSIONS_DIR / room.session_name
+
+        try:
+            # Wait for any in-flight ASR/MT/TTS tasks to complete
+            pending = [t for t in background_tasks if not t.done()]
+            if pending:
+                print(
+                    f"[Room {room_id}] ⏳ Waiting for {len(pending)} "
+                    f"background tasks before finalising…"
+                )
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            # Write audio tracks
+            wav_paths = room.recorder.finalize(session_dir)
+
+            # Write transcript
+            transcript_path = None
+            if room.transcript_logger is not None:
+                transcript_path = room.transcript_logger.finalize(session_dir)
+
+            # Write manifest
+            end_time = datetime.now()
+            name_a = "User A"
+            name_b = "User B"
+            for p in room.participants:
+                if p.role == "a":
+                    name_a = p.name
+                elif p.role == "b":
+                    name_b = p.name
+
+            write_manifest(
+                session_dir=session_dir,
+                session_name=room.session_name,
+                start_time=room.session_start_time or datetime.now(),
+                end_time=end_time,
+                language_a=room.language_a,
+                language_b=room.language_b,
+                name_a=name_a,
+                name_b=name_b,
+                room_id=room_id,
+                transcript_entries=(
+                    room.transcript_logger.entry_count
+                    if room.transcript_logger else 0
+                ),
+            )
+
+            # Notify participants that artifacts are ready
+            for p in room.participants:
+                if p.ws_open:
+                    await p.send_json_safe({
+                        "type": "session_artifacts",
+                        "session_name": room.session_name,
+                        "download_url": f"/api/sessions/{room.session_name}/download",
+                    })
+
+            print(
+                f"[Room {room_id}] 📼 Session artifacts saved to "
+                f"{session_dir}"
+            )
+        except Exception as e:
+            print(f"[Room {room_id}] ❌ Failed to finalise session recording: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Clean up recorder references
+            room.recorder = None
+            room.transcript_logger = None
 
     # --- main receive loop ------------------------------------------------
     print(
@@ -1118,6 +1268,8 @@ async def session_websocket(websocket: WebSocket):
         # If session was active and this user leaving kills it, end session
         if room.session_active:
             room.session_active = False
+            # Phase 10: finalise recording on disconnect
+            await _finalize_session_recording()
 
         # Notify partner of departure
         partner = room.get_partner(participant)
@@ -1185,3 +1337,75 @@ async def list_recordings():
             for f in sorted(files, reverse=True)
         ]
     }
+
+
+@app.get("/api/sessions/{session_name}/download")
+async def download_session(session_name: str):
+    """
+    Download all session artifacts as a zip archive.
+
+    Returns a zip containing the two language WAV files, the transcript
+    text file, and the SHA-256 manifest JSON.
+    """
+    import zipfile
+    from fastapi.responses import StreamingResponse
+
+    session_dir = SESSIONS_DIR / session_name
+    if not session_dir.exists() or not session_dir.is_dir():
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Session '{session_name}' not found"},
+        )
+
+    # Collect all files in the session directory
+    files = sorted(f for f in session_dir.iterdir() if f.is_file())
+    if not files:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Session '{session_name}' has no files"},
+        )
+
+    # Build zip in memory
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(f, arcname=f"{session_name}/{f.name}")
+    zip_buffer.seek(0)
+
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{session_name}.zip"'
+        },
+    )
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    """List all saved session recordings."""
+    if not SESSIONS_DIR.exists():
+        return {"sessions": []}
+
+    sessions_list = []
+    for d in sorted(SESSIONS_DIR.iterdir(), reverse=True):
+        if d.is_dir():
+            manifest_files = list(d.glob("*_manifest.json"))
+            manifest_data = None
+            if manifest_files:
+                try:
+                    manifest_data = json.loads(
+                        manifest_files[0].read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    pass
+
+            sessions_list.append({
+                "session_name": d.name,
+                "files": [f.name for f in sorted(d.iterdir()) if f.is_file()],
+                "manifest": manifest_data,
+            })
+
+    return {"sessions": sessions_list}
