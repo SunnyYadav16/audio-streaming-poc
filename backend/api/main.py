@@ -12,12 +12,16 @@ import io
 import json
 import wave
 import asyncio
-import string
 import random
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# Load .env from the backend directory before anything else reads env vars
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 
 # Force line-buffered stdout so print() output appears immediately in
 # log files when running under nohup / systemd / Docker.
@@ -41,6 +45,7 @@ from services.session_recorder import (
     write_manifest,
     SESSIONS_DIR,
 )
+from services.legal_verifier import get_legal_verifier
 
 app = FastAPI(title="Audio Streaming API")
 
@@ -421,6 +426,13 @@ async def startup_event():
     get_tts_service()
     print("[API] TTS voices ready")
 
+    # Legal verifier — optional, only loads if VERTEX_PROJECT is set
+    legal_verifier = get_legal_verifier()
+    if legal_verifier:
+        print("[API] Legal verifier ready (LLaMA 4 via Vertex AI)")
+    else:
+        print("[API] Legal verifier disabled (VERTEX_PROJECT not set)")
+
 @app.websocket("/ws/audio")
 async def audio_websocket(websocket: WebSocket):
     """WebSocket endpoint for receiving audio streams with VAD and ASR.
@@ -449,6 +461,7 @@ async def audio_websocket(websocket: WebSocket):
     asr_service = get_asr_service()
     mt_service = get_mt_service() if target_lang_param else None
     tts_service = get_tts_service() if (target_lang_param and tts_enabled) else None
+    legal_verifier = get_legal_verifier() if target_lang_param else None
 
     # Track background ASR tasks so we can clean up on disconnect
     background_tasks: list[asyncio.Task] = []
@@ -514,6 +527,26 @@ async def audio_websocket(websocket: WebSocket):
                     if translated:
                         payload["translation"] = translated
                         payload["target_language"] = target_lang_param
+
+                # --- Legal Context Verification (final transcripts only) ---
+                if (
+                    msg_type == "transcript"
+                    and legal_verifier is not None
+                    and payload.get("translation")
+                    and source_lang in {"en", "es", "pt"}
+                    and target_lang_param in {"en", "es", "pt"}
+                ):
+                    verification = await asyncio.to_thread(
+                        legal_verifier.verify,
+                        text,
+                        payload["translation"],
+                        source_lang,
+                        target_lang_param,
+                    )
+                    payload["verified_translation"] = verification.verified_translation
+                    payload["accuracy_score"]        = verification.accuracy_score
+                    payload["accuracy_note"]         = verification.accuracy_note
+                    payload["used_fallback"]         = verification.used_fallback
 
                 # --- TTS (only for final transcripts with a translation) ---
                 if (
@@ -787,6 +820,7 @@ async def session_websocket(websocket: WebSocket):
     asr_service = get_asr_service()
     mt_service = get_mt_service()
     tts_service = get_tts_service()
+    legal_verifier = get_legal_verifier()
     turn = room.turn  # shorthand for the state machine
 
     background_tasks: list[asyncio.Task] = []
@@ -868,6 +902,27 @@ async def session_websocket(websocket: WebSocket):
                         }
                         if duration is not None:
                             partner_payload["duration"] = round(duration, 2)
+
+                        # Legal verification (final transcripts only)
+                        if (
+                            msg_type == "transcript"
+                            and legal_verifier is not None
+                            and source_lang in {"en", "es", "pt"}
+                            and target_lang in {"en", "es", "pt"}
+                        ):
+                            verification = await asyncio.to_thread(
+                                legal_verifier.verify,
+                                text,
+                                translated,
+                                source_lang,
+                                target_lang,
+                            )
+                            # Attach to both self and partner payloads
+                            for _p in (self_payload, partner_payload):
+                                _p["verified_translation"] = verification.verified_translation
+                                _p["accuracy_score"]        = verification.accuracy_score
+                                _p["accuracy_note"]         = verification.accuracy_note
+                                _p["used_fallback"]         = verification.used_fallback
 
                         # TTS only for final transcripts
                         if msg_type == "transcript":
