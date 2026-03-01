@@ -31,6 +31,10 @@ interface TranscriptEntry {
     language: string;
     translation?: string;
     targetLanguage?: string;
+    verifiedTranslation?: string;
+    accuracyScore?: number;
+    accuracyNote?: string;
+    usedFallback?: boolean;
     duration?: number;
     timestamp: Date;
 }
@@ -236,6 +240,10 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio', onBa
                                 language: msg.language ?? 'unknown',
                                 translation: msg.translation,
                                 targetLanguage: msg.target_language,
+                                verifiedTranslation: msg.verified_translation,
+                                accuracyScore: msg.accuracy_score,
+                                accuracyNote: msg.accuracy_note,
+                                usedFallback: msg.used_fallback,
                                 duration: msg.duration,
                                 timestamp: new Date(),
                             },
@@ -566,6 +574,71 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio', onBa
                     margin-bottom: 2px;
                 }
 
+                /* verification block */
+                .ca-entry-verified {
+                    margin-top: 6px;
+                    padding: 8px 12px;
+                    background: rgba(34,197,94,0.07);
+                    border-left: 3px solid rgba(34,197,94,0.4);
+                    border-radius: 6px;
+                    font-size: 14px;
+                    line-height: 1.6;
+                    color: #86efac;
+                    word-break: break-word;
+                }
+                .ca-entry-verified-header {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    margin-bottom: 4px;
+                    flex-wrap: wrap;
+                }
+                .ca-entry-verified-label {
+                    font-family: 'JetBrains Mono', monospace;
+                    font-size: 10px;
+                    font-weight: 700;
+                    letter-spacing: 1.5px;
+                    text-transform: uppercase;
+                    color: #22c55e;
+                }
+                .ca-accuracy-chip {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 4px;
+                    padding: 2px 8px;
+                    border-radius: 20px;
+                    font-family: 'JetBrains Mono', monospace;
+                    font-size: 10px;
+                    font-weight: 700;
+                    letter-spacing: 0.5px;
+                }
+                .ca-accuracy-chip.high {
+                    background: rgba(34,197,94,0.15);
+                    color: #22c55e;
+                    border: 1px solid rgba(34,197,94,0.3);
+                }
+                .ca-accuracy-chip.medium {
+                    background: rgba(245,158,11,0.15);
+                    color: #f59e0b;
+                    border: 1px solid rgba(245,158,11,0.3);
+                }
+                .ca-accuracy-chip.low {
+                    background: rgba(239,68,68,0.12);
+                    color: #ef4444;
+                    border: 1px solid rgba(239,68,68,0.25);
+                }
+                .ca-accuracy-note {
+                    font-size: 11px;
+                    color: rgba(134,239,172,0.65);
+                    font-style: italic;
+                    margin-top: 2px;
+                }
+                .ca-verified-unchanged {
+                    font-size: 13px;
+                    color: rgba(34,197,94,0.6);
+                    font-style: italic;
+                }
+
                 /* live / partial transcript */
                 .ca-live {
                     display: flex;
@@ -860,6 +933,32 @@ export function AudioRecorder({ serverUrl = 'ws://localhost:8000/ws/audio', onBa
                                                         {langLabel[entry.targetLanguage ?? ''] ?? entry.targetLanguage?.toUpperCase() ?? 'Translation'}
                                                     </div>
                                                     {entry.translation}
+                                                </div>
+                                            )}
+                                            {/* Legal verification block */}
+                                            {entry.verifiedTranslation && !entry.usedFallback && (
+                                                <div className="ca-entry-verified">
+                                                    <div className="ca-entry-verified-header">
+                                                        <span className="ca-entry-verified-label">✦ Legal Verified</span>
+                                                        {entry.accuracyScore != null && (() => {
+                                                            const score = entry.accuracyScore;
+                                                            const cls = score >= 0.9 ? 'high' : score >= 0.7 ? 'medium' : 'low';
+                                                            const pct = Math.round(score * 100);
+                                                            return (
+                                                                <span className={`ca-accuracy-chip ${cls}`}>
+                                                                    {score >= 0.9 ? '✔' : score >= 0.7 ? '▲' : '⚠'} {pct}% match
+                                                                </span>
+                                                            );
+                                                        })()}
+                                                    </div>
+                                                    {entry.verifiedTranslation === entry.translation ? (
+                                                        <span className="ca-verified-unchanged">No changes — translation is legally precise.</span>
+                                                    ) : (
+                                                        entry.verifiedTranslation
+                                                    )}
+                                                    {entry.accuracyNote && entry.verifiedTranslation !== entry.translation && (
+                                                        <div className="ca-accuracy-note">{entry.accuracyNote}</div>
+                                                    )}
                                                 </div>
                                             )}
                                             <div className="ca-entry-meta">

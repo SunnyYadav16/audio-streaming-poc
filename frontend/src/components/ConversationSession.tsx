@@ -41,6 +41,10 @@ interface ChatMessage {
     language: string;
     translation?: string;
     targetLanguage?: string;
+    verifiedTranslation?: string;
+    accuracyScore?: number;
+    accuracyNote?: string;
+    usedFallback?: boolean;
     duration?: number;
     timestamp: Date;
 }
@@ -50,9 +54,9 @@ interface ChatMessage {
 /* ------------------------------------------------------------------ */
 
 const MARKER_SESSION_START = new Uint8Array([0x53, 0x54, 0x52, 0x54]); // b'STRT'
-const MARKER_SESSION_END   = new Uint8Array([0x45, 0x4E, 0x44, 0x53]); // b'ENDS'
-const MARKER_MIC_MUTE      = new Uint8Array([0x4D, 0x55, 0x54, 0x45]); // b'MUTE'
-const MARKER_MIC_UNMUTE    = new Uint8Array([0x55, 0x4E, 0x4D, 0x54]); // b'UNMT'
+const MARKER_SESSION_END = new Uint8Array([0x45, 0x4E, 0x44, 0x53]); // b'ENDS'
+const MARKER_MIC_MUTE = new Uint8Array([0x4D, 0x55, 0x54, 0x45]); // b'MUTE'
+const MARKER_MIC_UNMUTE = new Uint8Array([0x55, 0x4E, 0x4D, 0x54]); // b'UNMT'
 
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
@@ -415,6 +419,10 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                     language: msg.language ?? 'unknown',
                                     translation: msg.translation,
                                     targetLanguage: msg.target_language,
+                                    verifiedTranslation: msg.verified_translation,
+                                    accuracyScore: msg.accuracy_score,
+                                    accuracyNote: msg.accuracy_note,
+                                    usedFallback: msg.used_fallback,
                                     duration: msg.duration,
                                     timestamp: new Date(),
                                 }]);
@@ -889,6 +897,50 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                 .cs-msg.self .cs-msg-translation-label { color: #6366f1; }
                 .cs-msg.partner .cs-msg-translation-label { color: #22d3ee; }
 
+                /* legal verification block inside chat bubbles */
+                .cs-msg-verified {
+                    margin-top: 4px; padding: 7px 12px;
+                    background: rgba(34,197,94,0.07);
+                    border-left: 3px solid rgba(34,197,94,0.35);
+                    border-radius: 8px; font-size: 13px;
+                    color: #86efac; line-height: 1.5; word-break: break-word;
+                }
+                .cs-msg-verified-header {
+                    display: flex; align-items: center; gap: 6px;
+                    margin-bottom: 3px; flex-wrap: wrap;
+                }
+                .cs-msg-verified-label {
+                    font-family: 'JetBrains Mono', monospace;
+                    font-size: 9px; font-weight: 700;
+                    letter-spacing: 1.5px; text-transform: uppercase;
+                    color: #22c55e;
+                }
+                .cs-accuracy-chip {
+                    display: inline-flex; align-items: center; gap: 3px;
+                    padding: 1px 7px; border-radius: 20px;
+                    font-family: 'JetBrains Mono', monospace;
+                    font-size: 9px; font-weight: 700;
+                }
+                .cs-accuracy-chip.high {
+                    background: rgba(34,197,94,0.15); color: #22c55e;
+                    border: 1px solid rgba(34,197,94,0.3);
+                }
+                .cs-accuracy-chip.medium {
+                    background: rgba(245,158,11,0.15); color: #f59e0b;
+                    border: 1px solid rgba(245,158,11,0.3);
+                }
+                .cs-accuracy-chip.low {
+                    background: rgba(239,68,68,0.12); color: #ef4444;
+                    border: 1px solid rgba(239,68,68,0.25);
+                }
+                .cs-accuracy-note {
+                    font-size: 10px; color: rgba(134,239,172,0.6);
+                    font-style: italic; margin-top: 2px;
+                }
+                .cs-verified-unchanged {
+                    font-size: 12px; color: rgba(34,197,94,0.6); font-style: italic;
+                }
+
                 .cs-msg-meta {
                     display: flex; gap: 10px; margin-top: 4px;
                     font-family: 'JetBrains Mono', monospace;
@@ -1097,7 +1149,7 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                     </div>
                                     <button className="cs-btn success" onClick={startSession}>
                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                                            <path d="M8 5v14l11-7z"/>
+                                            <path d="M8 5v14l11-7z" />
                                         </svg>
                                         Start Session
                                     </button>
@@ -1161,27 +1213,25 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
 
                             {/* Status ring */}
                             <div className="cs-ring-wrap">
-                                <div className={`cs-ring ${
-                                    isMuted ? 'muted-ring'
+                                <div className={`cs-ring ${isMuted ? 'muted-ring'
                                     : micLocked ? 'locked'
-                                    : isSpeaking ? 'speaking'
-                                    : isRecording ? 'recording' : ''
-                                }`} />
+                                        : isSpeaking ? 'speaking'
+                                            : isRecording ? 'recording' : ''
+                                    }`} />
                                 <div className="cs-timer">
                                     {isRecording ? formatDuration(duration) : '--:--'}
                                 </div>
                             </div>
-                            <div className={`cs-status ${
-                                isMuted ? 'muted-status'
+                            <div className={`cs-status ${isMuted ? 'muted-status'
                                 : micLocked ? 'locked'
-                                : isSpeaking ? 'speaking'
-                                : isRecording ? 'recording' : ''
-                            }`}>
+                                    : isSpeaking ? 'speaking'
+                                        : isRecording ? 'recording' : ''
+                                }`}>
                                 {isMuted
                                     ? 'Muted'
                                     : micLocked ? 'Mic paused — listening'
-                                    : isSpeaking ? 'Speaking...'
-                                    : isRecording ? 'Listening' : 'Inactive'}
+                                        : isSpeaking ? 'Speaking...'
+                                            : isRecording ? 'Listening' : 'Inactive'}
                             </div>
 
                             {/* TTS / locked indicator */}
@@ -1204,19 +1254,19 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                 {isMuted ? (
                                     <>
                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                            <line x1="1" y1="1" x2="23" y2="23"/>
-                                            <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/>
-                                            <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2c0 .76-.13 1.49-.35 2.17"/>
-                                            <line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+                                            <line x1="1" y1="1" x2="23" y2="23" />
+                                            <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
+                                            <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2c0 .76-.13 1.49-.35 2.17" />
+                                            <line x1="12" y1="19" x2="12" y2="23" /><line x1="8" y1="23" x2="16" y2="23" />
                                         </svg>
                                         Unmute Mic
                                     </>
                                 ) : (
                                     <>
                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                                            <line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+                                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                                            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                                            <line x1="12" y1="19" x2="12" y2="23" /><line x1="8" y1="23" x2="16" y2="23" />
                                         </svg>
                                         Mute Mic
                                     </>
@@ -1227,7 +1277,7 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                             {isCreator && (
                                 <button className="cs-btn warning" onClick={endSession}>
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                                        <rect x="6" y="6" width="12" height="12" rx="1"/>
+                                        <rect x="6" y="6" width="12" height="12" rx="1" />
                                     </svg>
                                     End Session
                                 </button>
@@ -1278,22 +1328,22 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                 <div className="cs-empty-icon">
                                     {phase === 'lobby' ? '🔗'
                                         : phase === 'waiting' ? '⏳'
-                                        : phase === 'ready' ? '✋'
-                                        : phase === 'ended' ? '👋'
-                                        : '💬'}
+                                            : phase === 'ready' ? '✋'
+                                                : phase === 'ended' ? '👋'
+                                                    : '💬'}
                                 </div>
                                 <div className="cs-empty-text">
                                     {phase === 'lobby'
                                         ? 'Create or join a room to start a translated conversation.'
                                         : phase === 'waiting'
-                                        ? 'Waiting for your partner to join. Share the room code!'
-                                        : phase === 'ready'
-                                        ? isCreator
-                                            ? 'Your partner has joined. Click "Start Session" to begin.'
-                                            : 'Connected! Waiting for the host to start the session.'
-                                        : phase === 'ended'
-                                        ? 'The conversation has ended.'
-                                        : 'Start speaking — your conversation will appear here in real time.'}
+                                            ? 'Waiting for your partner to join. Share the room code!'
+                                            : phase === 'ready'
+                                                ? isCreator
+                                                    ? 'Your partner has joined. Click "Start Session" to begin.'
+                                                    : 'Connected! Waiting for the host to start the session.'
+                                                : phase === 'ended'
+                                                    ? 'The conversation has ended.'
+                                                    : 'Start speaking — your conversation will appear here in real time.'}
                                 </div>
                             </div>
                         ) : (
@@ -1312,6 +1362,32 @@ export function ConversationSession({ onBack }: { onBack: () => void }) {
                                                     {langFlag[msg.targetLanguage ?? ''] ?? msg.targetLanguage?.toUpperCase() ?? 'Translation'}
                                                 </div>
                                                 {msg.translation}
+                                            </div>
+                                        )}
+                                        {/* Legal verification block */}
+                                        {msg.verifiedTranslation && !msg.usedFallback && (
+                                            <div className="cs-msg-verified">
+                                                <div className="cs-msg-verified-header">
+                                                    <span className="cs-msg-verified-label">✦ Legal Verified</span>
+                                                    {msg.accuracyScore != null && (() => {
+                                                        const score = msg.accuracyScore!;
+                                                        const cls = score >= 0.9 ? 'high' : score >= 0.7 ? 'medium' : 'low';
+                                                        const pct = Math.round(score * 100);
+                                                        return (
+                                                            <span className={`cs-accuracy-chip ${cls}`}>
+                                                                {score >= 0.9 ? '✔' : score >= 0.7 ? '▲' : '⚠'} {pct}%
+                                                            </span>
+                                                        );
+                                                    })()}
+                                                </div>
+                                                {msg.verifiedTranslation === msg.translation ? (
+                                                    <span className="cs-verified-unchanged">No changes — legally precise.</span>
+                                                ) : (
+                                                    msg.verifiedTranslation
+                                                )}
+                                                {msg.accuracyNote && msg.verifiedTranslation !== msg.translation && (
+                                                    <div className="cs-accuracy-note">{msg.accuracyNote}</div>
+                                                )}
                                             </div>
                                         )}
                                         <div className="cs-msg-meta">
